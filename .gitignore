@@ -1,0 +1,6 @@
+# Build artifacts — auditors build from source
+pkg/
+blake3-wasm-single/pkg/
+blake3-wasm-rayon/pkg/
+blake3-source/
+target/
