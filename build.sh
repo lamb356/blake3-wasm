@@ -131,6 +131,11 @@ RUST
 
 (cd blake3-wasm-rayon && wasm-pack build --release --target web --out-dir pkg)
 
+# Patch workerHelpers.js: import('../../..') resolves to a directory URL in
+# browsers (no bundler), which fails. Replace with explicit file path.
+find blake3-wasm-rayon/pkg/snippets -name 'workerHelpers.js' \
+  -exec sed -i "s|import('../../..')|import('../../../blake3_wasm_rayon.js')|g" {} \;
+
 # --- Cleanup ---
 echo "[4/4] Cleaning build artifacts..."
 rm -rf blake3-source

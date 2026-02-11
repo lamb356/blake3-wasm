@@ -213,14 +213,23 @@
       }
       if (typeof SharedArrayBuffer !== 'undefined') {
         try {
-          const module = await import('./blake3-wasm-rayon/pkg/blake3_wasm_rayon.js');
-          const wasmResponse = await fetch('./blake3-wasm-rayon/pkg/blake3_wasm_rayon_bg.wasm');
-          const wasmBytes = await wasmResponse.arrayBuffer();
-          const wasmModule = await WebAssembly.compile(wasmBytes);
-          await module.default({ module_or_path: wasmModule });
-          await module.initThreadPool(4);
+          // Wrap in Promise.race — if workers hang (e.g. import resolution
+          // fails inside Web Worker), we time out and fall back to single-threaded.
+          const parallelInit = async () => {
+            const mod = await import('./blake3-wasm-rayon/pkg/blake3_wasm_rayon.js');
+            const wasmResponse = await fetch('./blake3-wasm-rayon/pkg/blake3_wasm_rayon_bg.wasm');
+            const wasmBytes = await wasmResponse.arrayBuffer();
+            const wasmModule = await WebAssembly.compile(wasmBytes);
+            await mod.default({ module_or_path: wasmModule });
+            await mod.initThreadPool(4);
+            return mod;
+          };
+          const timeout = new Promise((_, reject) =>
+            setTimeout(() => reject(new Error('Parallel init timeout (5s)')), 5000)
+          );
+          const mod = await Promise.race([parallelInit(), timeout]);
 
-          blake3Hash = (data) => module.hash(data);
+          blake3Hash = (data) => mod.hash(data);
           isParallel = true;
           isReady = true;
 

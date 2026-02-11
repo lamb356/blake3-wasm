@@ -152,6 +152,13 @@ Push-Location blake3-wasm-rayon
 wasm-pack build --release --target web --out-dir pkg
 Pop-Location
 
+# Patch workerHelpers.js: import('../../..') resolves to a directory URL in
+# browsers (no bundler), which fails. Replace with explicit file path.
+Get-ChildItem -Path blake3-wasm-rayon/pkg/snippets -Recurse -Filter 'workerHelpers.js' | ForEach-Object {
+    (Get-Content $_.FullName -Raw) -replace "import\('../../\.\.'\)", "import('../../../blake3_wasm_rayon.js')" |
+        Set-Content $_.FullName -Encoding UTF8 -NoNewline
+}
+
 # --- Cleanup ---
 Write-Host "[4/4] Cleaning build artifacts..."
 if (Test-Path blake3-source) { Remove-Item -Recurse -Force blake3-source }
