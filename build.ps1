@@ -103,7 +103,7 @@ panic = "abort"
 rustflags = [
   "-C", "target-feature=+atomics,+bulk-memory,+simd128",
   "-C", "link-arg=--shared-memory",
-  "-C", "link-arg=--max-memory=1073741824",
+  "-C", "link-arg=--max-memory=67108864",
   "-C", "link-arg=--import-memory",
   "-C", "link-arg=--export=__wasm_init_tls",
   "-C", "link-arg=--export=__tls_size",

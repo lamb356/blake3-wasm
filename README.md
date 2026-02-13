@@ -38,8 +38,9 @@ python -m http.server 8080
 
 Drop a file to compare BLAKE3 (WASM) vs SHA-256 (WebCrypto) throughput.
 
-- If SharedArrayBuffer is available: parallel mode (4 threads)
+- If SharedArrayBuffer is available: parallel mode (auto-detected thread count)
 - Otherwise: single-threaded SIMD fallback
+- Thread count can be changed via the dropdown selector (persists in URL hash)
 
 ## What Gets Built
 
@@ -59,3 +60,58 @@ Both are gitignored. Build from source to verify.
 | Pin BLAKE3 at tag 1.8.3 | Reproducible builds; matches crates.io |
 | Two builds (single + rayon) | browser-test.html auto-falls back; both wrappers are tiny |
 | Rayon uses nightly-2025-11-15 | Required for `build-std` with atomics/shared-memory |
+| WASM memory capped at 64 MB | Prevents OOM on mobile (iPhones reject 1 GB allocations) |
+| Thread count auto-detected | Uses `navigator.hardwareConcurrency`; user can override via selector |
+
+## Self-Hosted Deployment
+
+The parallel (rayon) WASM build requires [SharedArrayBuffer](https://developer.mozilla.org/en-US/docs/Web/JavaScript/Reference/Global_Objects/SharedArrayBuffer), which browsers only enable when both of these response headers are present:
+
+```
+Cross-Origin-Opener-Policy: same-origin
+Cross-Origin-Embedder-Policy: require-corp
+```
+
+### Nginx
+
+```nginx
+server {
+    # ... existing config ...
+    add_header Cross-Origin-Opener-Policy "same-origin" always;
+    add_header Cross-Origin-Embedder-Policy "require-corp" always;
+}
+```
+
+### Apache
+
+```apache
+<IfModule mod_headers.c>
+    Header always set Cross-Origin-Opener-Policy "same-origin"
+    Header always set Cross-Origin-Embedder-Policy "require-corp"
+</IfModule>
+```
+
+### Cloudflare Pages
+
+Create a `_headers` file in the publish directory:
+
+```
+/*
+  Cross-Origin-Opener-Policy: same-origin
+  Cross-Origin-Embedder-Policy: require-corp
+```
+
+### Static Hosting (GitHub Pages, S3, etc.)
+
+If you can't set response headers, the repo includes `coi-serviceworker.min.js` which injects the headers client-side on the second page load. The demo page loads it automatically — no extra configuration needed. The single-threaded fallback works immediately on the first load.
+
+### Memory Configuration
+
+The rayon build sets `--max-memory=67108864` (64 MB) in the linker args. This limits the maximum hashable file size to ~60 MB (wasm-bindgen copies the input into WASM linear memory). To increase this, edit the `--max-memory` value in `build.sh` (line 87) or `build.ps1` (line 106) and rebuild:
+
+```bash
+# Example: 256 MB
+"-C", "link-arg=--max-memory=268435456",
+```
+
+Note: Values above ~256 MB may fail to allocate on mobile devices.

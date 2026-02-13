@@ -4,10 +4,8 @@
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <title>BLAKE3 vs SHA-256 Browser Benchmark</title>
-  <!-- Try to enable SharedArrayBuffer on GitHub Pages (may not work on all browsers) -->
   <script src="coi-serviceworker.min.js"></script>
   <style>
-    /* Minimal CSS for readability */
     body {
       font-family: system-ui, sans-serif;
       max-width: 1000px;
@@ -19,7 +17,25 @@
     h1 { text-align: center; margin: 8px 0; }
     .subtitle { text-align: center; color: #888; margin-bottom: 10px; }
 
-    /* File input area */
+    .thread-selector {
+      text-align: center;
+      margin-bottom: 8px;
+    }
+    .thread-selector label {
+      color: #888;
+      font-size: 13px;
+      margin-right: 6px;
+    }
+    .thread-selector select {
+      background: #252540;
+      color: #eee;
+      border: 1px solid #444;
+      border-radius: 4px;
+      padding: 4px 8px;
+      font-size: 13px;
+    }
+    .thread-selector select option:disabled { color: #666; }
+
     .file-area {
       border: 2px dashed #444;
       border-radius: 8px;
@@ -42,7 +58,6 @@
       margin-top: 4px;
     }
 
-    /* Results grid - side by side comparison */
     .results {
       display: grid;
       grid-template-columns: 1fr 1fr;
@@ -82,6 +97,18 @@
       color: #ccc;
     }
 
+    .benchmark-meta {
+      text-align: center;
+      margin-top: 8px;
+      padding: 6px 12px;
+      background: #252540;
+      border-radius: 6px;
+      font-size: 12px;
+      color: #aaa;
+      line-height: 1.6;
+    }
+    .benchmark-meta .sep { color: #444; margin: 0 6px; }
+
     .system-info {
       background: #252540;
       border-radius: 8px;
@@ -104,7 +131,13 @@
   <h1>BLAKE3 vs SHA-256</h1>
   <p class="subtitle">Browser Benchmark - Drop a file to compare</p>
 
-  <!-- File input (supports both drag-drop and click) -->
+  <!-- Thread count selector -->
+  <div class="thread-selector">
+    <label for="thread-select">Threads:</label>
+    <select id="thread-select"></select>
+  </div>
+
+  <!-- File input -->
   <div class="file-area" id="file-area">
     <p style="margin: 4px 0;">Drop a file here</p>
     <button type="button">Choose File</button>
@@ -113,10 +146,8 @@
 
   <!-- Side-by-side results -->
   <div class="results" id="results" style="display: none;">
-    <!-- Mode banner spanning both columns -->
     <div id="mode-banner" style="grid-column: 1 / -1; text-align: center; padding: 4px 12px; border-radius: 6px; font-size: 12px; font-weight: bold;"></div>
 
-    <!-- BLAKE3 Result -->
     <div class="result-card blake3" id="blake3-card">
       <h3 id="blake3-title">WASM BLAKE3</h3>
       <div class="stat">
@@ -131,7 +162,6 @@
       </div>
     </div>
 
-    <!-- SHA-256 Result -->
     <div class="result-card sha256" id="sha256-card">
       <h3>WebCrypto SHA-256</h3>
       <div class="stat">
@@ -153,9 +183,12 @@
     Loading WASM module...
   </p>
 
-  <!-- System Info — collapsible for compact layout -->
+  <!-- Benchmark metadata — always visible after a run -->
+  <div class="benchmark-meta" id="benchmark-meta" style="display: none;"></div>
+
+  <!-- Full system info — collapsible -->
   <details class="system-info" id="system-info">
-    <summary>System Info</summary>
+    <summary>Full System Info</summary>
     <div>Browser: <span class="val" id="info-browser">-</span></div>
     <div>Platform: <span class="val" id="info-platform">-</span></div>
     <div>CPU Cores: <span class="val" id="info-cores">-</span></div>
@@ -163,65 +196,98 @@
     <div>Benchmark: <span class="val" id="info-timestamp">-</span></div>
   </details>
 
-  <!--
-    ============================================================
-    BLAKE3 WASM BROWSER IMPLEMENTATION
-    ============================================================
-
-    This code uses WASM BLAKE3 in the browser with automatic fallback:
-    - If SharedArrayBuffer is available: uses 4-thread parallel mode
-    - Otherwise: uses single-threaded SIMD mode
-
-    Both modes produce identical hashes. Parallel is faster on
-    multi-core systems, but single-threaded works everywhere.
-
-    Dependencies (parallel mode):
-    - blake3-wasm-rayon/pkg/blake3_wasm_rayon.js
-    - blake3-wasm-rayon/pkg/blake3_wasm_rayon_bg.wasm
-
-    Dependencies (single-threaded fallback):
-    - blake3-wasm-single/pkg/blake3_wasm_single.js
-    - blake3-wasm-single/pkg/blake3_wasm_single_bg.wasm
-    ============================================================
-  -->
   <script type="module">
+    // ============================================================
+    // THREAD COUNT CONFIGURATION
+    // ============================================================
+    const cpuCores = navigator.hardwareConcurrency || 4;
+    const hasSAB = typeof SharedArrayBuffer !== 'undefined';
+
+    function getRequestedThreads() {
+      const params = new URLSearchParams(window.location.hash.slice(1));
+      const raw = params.get('threads');
+      if (raw === null || raw === 'auto') return cpuCores;
+      const val = parseInt(raw, 10);
+      if ([1, 2, 4, 8].includes(val)) return val;
+      return cpuCores;
+    }
+
+    function populateThreadSelector() {
+      const select = document.getElementById('thread-select');
+      const requested = getRequestedThreads();
+      const params = new URLSearchParams(window.location.hash.slice(1));
+      const isExplicit = params.has('threads') && params.get('threads') !== 'auto';
+
+      const options = [
+        { value: 'auto', label: `Auto (${cpuCores} cores)` },
+        { value: '1',    label: '1 thread' },
+        { value: '2',    label: '2 threads' },
+        { value: '4',    label: '4 threads' },
+        { value: '8',    label: '8 threads' },
+      ];
+
+      for (const opt of options) {
+        const el = document.createElement('option');
+        el.value = opt.value;
+        el.textContent = opt.label;
+        const numVal = parseInt(opt.value, 10);
+
+        if (!hasSAB && numVal > 1) {
+          el.textContent += ' (unavailable)';
+          el.disabled = true;
+        }
+
+        if (!isExplicit && opt.value === 'auto') {
+          el.selected = true;
+        } else if (isExplicit && numVal === requested) {
+          el.selected = true;
+        }
+
+        select.appendChild(el);
+      }
+
+      select.addEventListener('change', (e) => {
+        const val = e.target.value;
+        if (val === 'auto') {
+          history.replaceState(null, '', window.location.pathname);
+        } else {
+          history.replaceState(null, '', window.location.pathname + '#threads=' + val);
+        }
+        window.location.reload();
+      });
+    }
+
     // ============================================================
     // GLOBAL STATE
     // ============================================================
-    let blake3Hash = null;    // Hash function reference
-    let isReady = false;      // Initialization complete flag
-    let isParallel = false;   // Using parallel mode?
+    let blake3Hash = null;
+    let isReady = false;
+    let isParallel = false;
+    let activeThreadCount = 0;
 
     // ============================================================
-    // INITIALIZATION - Try parallel, fall back to single-threaded
+    // INITIALIZATION
     // ============================================================
     async function init() {
       const status = document.getElementById('status');
       const blake3Title = document.getElementById('blake3-title');
       const modeBanner = document.getElementById('mode-banner');
+      const threadCount = getRequestedThreads();
 
-      // Debug: log SharedArrayBuffer availability for Brave/Safari debugging
-      console.log('[BLAKE3] SharedArrayBuffer defined:', typeof SharedArrayBuffer !== 'undefined');
+      console.log('[BLAKE3] SharedArrayBuffer:', hasSAB);
       console.log('[BLAKE3] crossOriginIsolated:', self.crossOriginIsolated);
-      console.log('[BLAKE3] COOP header:', document.referrer !== undefined ? 'page loaded' : 'unknown');
+      console.log('[BLAKE3] Requested threads:', threadCount);
 
-      // Try parallel mode first (requires SharedArrayBuffer)
-      if (typeof SharedArrayBuffer === 'undefined') {
-        console.warn('[BLAKE3] SharedArrayBuffer is undefined — skipping parallel mode');
-        console.warn('[BLAKE3] crossOriginIsolated:', self.crossOriginIsolated,
-          '— COOP/COEP headers are required for SharedArrayBuffer');
-      }
-      if (typeof SharedArrayBuffer !== 'undefined') {
+      // --- Try parallel mode if threads > 1 and SharedArrayBuffer available ---
+      if (threadCount > 1 && hasSAB) {
         try {
-          // Wrap in Promise.race — if workers hang (e.g. import resolution
-          // fails inside Web Worker), we time out and fall back to single-threaded.
           const parallelInit = async () => {
             const mod = await import('./blake3-wasm-rayon/pkg/blake3_wasm_rayon.js');
             const wasmResponse = await fetch('./blake3-wasm-rayon/pkg/blake3_wasm_rayon_bg.wasm');
             const wasmBytes = await wasmResponse.arrayBuffer();
             const wasmModule = await WebAssembly.compile(wasmBytes);
             await mod.default({ module_or_path: wasmModule });
-            await mod.initThreadPool(4);
+            await mod.initThreadPool(threadCount);
             return mod;
           };
           const timeout = new Promise((_, reject) =>
@@ -232,67 +298,67 @@
           blake3Hash = (data) => mod.hash(data);
           isParallel = true;
           isReady = true;
+          activeThreadCount = threadCount;
 
-          blake3Title.textContent = 'WASM BLAKE3 (4 threads)';
-          status.textContent = 'Ready! Using parallel mode (4 threads).';
+          blake3Title.textContent = `WASM BLAKE3 (${threadCount} threads)`;
+          status.textContent = `Ready! Parallel mode (${threadCount} threads).`;
           status.style.color = '#4ade80';
-          modeBanner.textContent = 'Parallel mode — 4 threads (SharedArrayBuffer + Web Workers)';
+          modeBanner.textContent = `Parallel mode \u2014 ${threadCount} threads (SharedArrayBuffer + Web Workers)`;
           modeBanner.style.background = '#1a3a1a';
           modeBanner.style.color = '#4ade80';
-          document.getElementById('info-mode').textContent = 'Parallel (4 threads, SharedArrayBuffer + Web Workers)';
-          console.log('[BLAKE3] Initialized: parallel mode (4 threads)');
+          document.getElementById('info-mode').textContent =
+            `Parallel (${threadCount} threads, SharedArrayBuffer + Web Workers)`;
+          console.log(`[BLAKE3] Initialized: parallel mode (${threadCount} threads)`);
         } catch (err) {
           console.warn('[BLAKE3] Parallel mode failed:', err.message);
-          console.warn('[BLAKE3] Full error:', err);
+        }
+      } else if (threadCount > 1) {
+        console.warn('[BLAKE3] SharedArrayBuffer unavailable — falling back to single-threaded');
+      }
+
+      // --- Single-threaded fallback (always works) ---
+      if (!isReady) {
+        try {
+          const module = await import('./blake3-wasm-single/pkg/blake3_wasm_single.js');
+          const wasmResponse = await fetch('./blake3-wasm-single/pkg/blake3_wasm_single_bg.wasm');
+          const wasmBytes = await wasmResponse.arrayBuffer();
+          const wasmModule = await WebAssembly.compile(wasmBytes);
+          await module.default(wasmModule);
+
+          blake3Hash = (data) => module.hash(data);
+          isParallel = false;
+          isReady = true;
+          activeThreadCount = 1;
+
+          blake3Title.textContent = 'WASM BLAKE3 (single-threaded)';
+          status.textContent = 'Ready! Single-threaded mode.';
+          status.style.color = '#fbbf24';
+          modeBanner.textContent = 'Single-threaded mode (WASM SIMD)';
+          modeBanner.style.background = '#3a2a1a';
+          modeBanner.style.color = '#fbbf24';
+          document.getElementById('info-mode').textContent = 'Single-threaded (WASM SIMD)';
+          console.log('[BLAKE3] Initialized: single-threaded mode');
+        } catch (err) {
+          status.textContent = 'Unable to load BLAKE3 module. Please try refreshing.';
+          status.style.color = '#f87171';
+          console.error('[BLAKE3] All init paths failed:', err);
         }
       }
-
-      // Fall back to single-threaded mode (skip if rayon already succeeded)
-      if (!isReady) try {
-        const module = await import('./blake3-wasm-single/pkg/blake3_wasm_single.js');
-        const wasmResponse = await fetch('./blake3-wasm-single/pkg/blake3_wasm_single_bg.wasm');
-        const wasmBytes = await wasmResponse.arrayBuffer();
-        const wasmModule = await WebAssembly.compile(wasmBytes);
-        await module.default(wasmModule);
-
-        blake3Hash = (data) => module.hash(data);
-        isParallel = false;
-        isReady = true;
-
-        blake3Title.textContent = 'WASM BLAKE3 (single-threaded)';
-        status.textContent = 'Ready! Using single-threaded mode.';
-        status.style.color = '#fbbf24';
-        modeBanner.textContent = 'Single-threaded mode (WASM SIMD)';
-        modeBanner.style.background = '#3a2a1a';
-        modeBanner.style.color = '#fbbf24';
-        document.getElementById('info-mode').textContent = 'Single-threaded (WASM SIMD)';
-        console.log('[BLAKE3] Initialized: single-threaded mode');
-      } catch (err) {
-        status.textContent = 'Failed to load BLAKE3: ' + err.message;
-        status.style.color = '#f87171';
-        console.error('BLAKE3 init error:', err);
-      }
-
     }
 
     // ============================================================
-    // HASH FUNCTIONS
+    // HELPERS
     // ============================================================
 
-    // Hash data with WebCrypto SHA-256
     async function hashSha256(data) {
       const hashBuffer = await crypto.subtle.digest('SHA-256', data);
       return new Uint8Array(hashBuffer);
     }
 
-    // Convert bytes to hex string
     function toHex(bytes) {
-      return Array.from(bytes)
-        .map(b => b.toString(16).padStart(2, '0'))
-        .join('');
+      return Array.from(bytes).map(b => b.toString(16).padStart(2, '0')).join('');
     }
 
-    // Format bytes as human-readable size
     function formatSize(bytes) {
       if (bytes < 1024) return bytes + ' B';
       if (bytes < 1024 * 1024) return (bytes / 1024).toFixed(1) + ' KB';
@@ -300,7 +366,16 @@
       return (bytes / 1024 / 1024 / 1024).toFixed(2) + ' GB';
     }
 
-    // Populate system info that doesn't depend on WASM init
+    function getBrowserShort() {
+      const ua = navigator.userAgent;
+      if (ua.includes('Firefox/')) return 'Firefox ' + ua.split('Firefox/')[1].split(' ')[0];
+      if (ua.includes('Edg/'))     return 'Edge ' + ua.split('Edg/')[1].split(' ')[0];
+      if (ua.includes('Chrome/'))  return 'Chrome ' + ua.split('Chrome/')[1].split(' ')[0];
+      if (ua.includes('Safari/') && !ua.includes('Chrome'))
+        return 'Safari ' + (ua.split('Version/')[1] || '').split(' ')[0];
+      return ua.slice(0, 30);
+    }
+
     function populateSystemInfo() {
       document.getElementById('info-browser').textContent = navigator.userAgent;
       document.getElementById('info-platform').textContent =
@@ -319,20 +394,29 @@
         return;
       }
 
+      // Guard: file too large for 64MB WASM memory
+      if (file.size > 60 * 1024 * 1024) {
+        const status = document.getElementById('status');
+        status.textContent = `File too large for WASM (${formatSize(file.size)} > 60 MB limit). Try a smaller file.`;
+        status.style.color = '#f87171';
+        return;
+      }
+
       const results = document.getElementById('results');
       const status = document.getElementById('status');
       const fileInfo = document.getElementById('file-info');
       results.style.display = 'grid';
       fileInfo.style.display = 'block';
-      fileInfo.textContent = `${file.name} — ${formatSize(file.size)}`;
+      fileInfo.textContent = `${file.name} \u2014 ${formatSize(file.size)}`;
       status.textContent = `Hashing ${file.name} (${formatSize(file.size)})...`;
-      document.getElementById('info-timestamp').textContent = new Date().toLocaleString();
 
-      // Read file into memory
+      const now = new Date();
+      document.getElementById('info-timestamp').textContent = now.toLocaleString();
+
       const arrayBuffer = await file.arrayBuffer();
       const data = new Uint8Array(arrayBuffer);
 
-      // --- BLAKE3 Benchmark ---
+      // --- BLAKE3 ---
       const blake3Start = performance.now();
       const blake3HashResult = blake3Hash(data);
       const blake3Time = performance.now() - blake3Start;
@@ -342,7 +426,7 @@
       document.getElementById('blake3-time').textContent = blake3Time.toFixed(2) + ' ms';
       document.getElementById('blake3-speed').textContent = blake3Speed.toFixed(0) + ' MB/s';
 
-      // --- SHA-256 Benchmark ---
+      // --- SHA-256 ---
       const sha256Start = performance.now();
       const sha256HashResult = await hashSha256(data);
       const sha256Time = performance.now() - sha256Start;
@@ -352,7 +436,7 @@
       document.getElementById('sha256-time').textContent = sha256Time.toFixed(2) + ' ms';
       document.getElementById('sha256-speed').textContent = sha256Speed.toFixed(0) + ' MB/s';
 
-      // Highlight winner (between single-threaded BLAKE3 and SHA-256)
+      // Highlight winner
       const blake3Card = document.getElementById('blake3-card');
       const sha256Card = document.getElementById('sha256-card');
       blake3Card.classList.remove('winner');
@@ -369,6 +453,19 @@
         status.textContent = `SHA-256 wins! ${ratio}x faster than BLAKE3`;
         status.style.color = '#a78bfa';
       }
+
+      // Show always-visible metadata bar
+      const meta = document.getElementById('benchmark-meta');
+      const modeStr = isParallel
+        ? `BLAKE3 parallel (${activeThreadCount} threads)`
+        : 'BLAKE3 single-threaded (SIMD)';
+      meta.innerHTML = [
+        modeStr,
+        `${cpuCores} cores`,
+        getBrowserShort(),
+        now.toLocaleTimeString()
+      ].map(s => `<span>${s}</span>`).join('<span class="sep">|</span>');
+      meta.style.display = 'block';
     }
 
     // ============================================================
@@ -378,15 +475,11 @@
     const fileArea = document.getElementById('file-area');
     const fileInput = document.getElementById('file-input');
 
-    // Click to open file picker (works on mobile)
     fileArea.addEventListener('click', () => fileInput.click());
-
-    // File selected via picker
     fileInput.addEventListener('change', (e) => {
       if (e.target.files[0]) benchmarkFile(e.target.files[0]);
     });
 
-    // Drag and drop
     fileArea.addEventListener('dragover', (e) => {
       e.preventDefault();
       fileArea.classList.add('dragover');
@@ -400,7 +493,10 @@
       if (e.dataTransfer.files[0]) benchmarkFile(e.dataTransfer.files[0]);
     });
 
-    // Initialize on page load
+    // ============================================================
+    // STARTUP
+    // ============================================================
+    populateThreadSelector();
     populateSystemInfo();
     init();
   </script>
