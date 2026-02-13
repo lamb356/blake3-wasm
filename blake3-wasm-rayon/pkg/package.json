@@ -1,0 +1,15 @@
+{
+  "name": "blake3_wasm_rayon",
+  "type": "module",
+  "version": "0.1.0",
+  "files": [
+    "blake3_wasm_rayon_bg.wasm",
+    "blake3_wasm_rayon.js",
+    "blake3_wasm_rayon.d.ts"
+  ],
+  "main": "blake3_wasm_rayon.js",
+  "types": "blake3_wasm_rayon.d.ts",
+  "sideEffects": [
+    "./snippets/*"
+  ]
+}
