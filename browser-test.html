@@ -208,7 +208,7 @@
       const raw = params.get('threads');
       if (raw === null || raw === 'auto') return cpuCores;
       const val = parseInt(raw, 10);
-      if ([1, 2, 4, 8].includes(val)) return val;
+      if (val >= 1 && val <= 16) return val;
       return cpuCores;
     }
 
@@ -222,8 +222,12 @@
         { value: 'auto', label: `Auto (${cpuCores} cores)` },
         { value: '1',    label: '1 thread' },
         { value: '2',    label: '2 threads' },
+        { value: '3',    label: '3 threads' },
         { value: '4',    label: '4 threads' },
+        { value: '5',    label: '5 threads' },
+        { value: '6',    label: '6 threads' },
         { value: '8',    label: '8 threads' },
+        { value: '10',   label: '10 threads' },
       ];
 
       for (const opt of options) {
