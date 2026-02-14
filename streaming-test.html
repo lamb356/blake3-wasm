@@ -1,0 +1,393 @@
+<!DOCTYPE html>
+<html>
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>BLAKE3 Streaming Worker Test</title>
+  <style>
+    body {
+      font-family: system-ui, sans-serif;
+      max-width: 1000px;
+      margin: 0 auto;
+      padding: 10px 15px;
+      background: #1a1a2e;
+      color: #eee;
+    }
+    h1 { text-align: center; margin: 8px 0; }
+    .subtitle { text-align: center; color: #888; margin-bottom: 10px; }
+
+    .summary {
+      text-align: center;
+      padding: 10px;
+      border-radius: 8px;
+      font-size: 16px;
+      font-weight: bold;
+      margin-bottom: 12px;
+    }
+    .summary.running { background: #252540; color: #fbbf24; }
+    .summary.pass { background: #1a3a1a; color: #4ade80; }
+    .summary.fail { background: #3a1a1a; color: #f87171; }
+
+    table {
+      width: 100%;
+      border-collapse: collapse;
+      margin-bottom: 16px;
+      font-size: 13px;
+    }
+    th {
+      background: #252540;
+      padding: 8px 10px;
+      text-align: left;
+      border-bottom: 2px solid #333;
+      color: #aaa;
+      font-size: 12px;
+      text-transform: uppercase;
+    }
+    td {
+      padding: 6px 10px;
+      border-bottom: 1px solid #2a2a40;
+      font-family: monospace;
+    }
+    tr.pass td:first-child { color: #4ade80; }
+    tr.fail td:first-child { color: #f87171; }
+    tr.running td { color: #fbbf24; }
+    td.hash { font-size: 11px; word-break: break-all; }
+    td.time { color: #888; }
+    td.match { font-weight: bold; }
+    td.match.yes { color: #4ade80; }
+    td.match.no { color: #f87171; }
+
+    h2 {
+      margin: 16px 0 8px 0;
+      padding-bottom: 4px;
+      border-bottom: 1px solid #333;
+      font-size: 16px;
+    }
+
+    .file-area {
+      border: 2px dashed #444;
+      border-radius: 8px;
+      padding: 15px 20px;
+      text-align: center;
+      margin-bottom: 10px;
+      cursor: pointer;
+    }
+    .file-area:hover { border-color: #666; }
+    .file-area.dragover { border-color: #4a9eff; background: #1a2a3e; }
+    .file-area input { display: none; }
+    .file-area button {
+      background: #4a9eff;
+      color: white;
+      border: none;
+      padding: 8px 18px;
+      border-radius: 6px;
+      font-size: 14px;
+      cursor: pointer;
+      margin-top: 4px;
+    }
+
+    .manual-results {
+      background: #252540;
+      border-radius: 8px;
+      padding: 12px 16px;
+      margin-top: 10px;
+    }
+    .manual-results .row {
+      display: flex;
+      justify-content: space-between;
+      padding: 4px 0;
+      border-bottom: 1px solid #333;
+    }
+    .manual-results .row:last-child { border-bottom: none; }
+    .manual-results .label { color: #888; font-size: 13px; }
+    .manual-results .value { font-family: monospace; font-size: 13px; word-break: break-all; }
+    .manual-results .match-status { font-weight: bold; font-size: 15px; }
+    .manual-results .match-status.yes { color: #4ade80; }
+    .manual-results .match-status.no { color: #f87171; }
+
+    .system-info {
+      background: #252540;
+      border-radius: 8px;
+      padding: 8px 14px;
+      margin-top: 10px;
+      font-size: 11px;
+      color: #888;
+      line-height: 1.4;
+    }
+    .system-info summary {
+      color: #ccc;
+      font-size: 12px;
+      font-weight: bold;
+      cursor: pointer;
+    }
+    .system-info span.val { color: #bbb; }
+  </style>
+</head>
+<body>
+  <h1>BLAKE3 Streaming Worker Test</h1>
+  <p class="subtitle">Verifies streaming Worker hashing matches hash_single</p>
+
+  <div id="summary" class="summary running">Initializing...</div>
+
+  <h2>Automated Tests</h2>
+  <table>
+    <thead>
+      <tr>
+        <th>Status</th>
+        <th>Size</th>
+        <th>Workers</th>
+        <th>Expected (hash_single)</th>
+        <th>Got (streaming)</th>
+        <th>Time</th>
+        <th>Match</th>
+      </tr>
+    </thead>
+    <tbody id="test-body"></tbody>
+  </table>
+
+  <h2>Manual File Test</h2>
+  <div class="file-area" id="file-area">
+    <p style="margin: 4px 0;">Drop a file here or click to choose</p>
+    <button type="button">Choose File</button>
+    <input type="file" id="file-input">
+  </div>
+  <div id="manual-results" class="manual-results" style="display: none;">
+    <div class="row">
+      <span class="label">File</span>
+      <span class="value" id="mr-file">-</span>
+    </div>
+    <div class="row">
+      <span class="label">Streaming hash</span>
+      <span class="value" id="mr-streaming-hash">-</span>
+    </div>
+    <div class="row">
+      <span class="label">Streaming time</span>
+      <span class="value" id="mr-streaming-time">-</span>
+    </div>
+    <div class="row">
+      <span class="label">hash_single</span>
+      <span class="value" id="mr-single-hash">-</span>
+    </div>
+    <div class="row">
+      <span class="label">hash_single time</span>
+      <span class="value" id="mr-single-time">-</span>
+    </div>
+    <div class="row">
+      <span class="label">Match</span>
+      <span class="value match-status" id="mr-match">-</span>
+    </div>
+  </div>
+
+  <details class="system-info">
+    <summary>System Info</summary>
+    <div>Browser: <span class="val" id="info-browser">-</span></div>
+    <div>CPU Cores: <span class="val" id="info-cores">-</span></div>
+  </details>
+
+  <script type="module">
+    import wasmInit, { hash_single } from './blake3-wasm-streaming/pkg/blake3_wasm_streaming.js';
+    import { StreamingHasher } from './streaming-hasher.js';
+
+    // Helpers
+    function toHex(bytes) {
+      return Array.from(bytes).map(b => b.toString(16).padStart(2, '0')).join('');
+    }
+
+    function formatSize(bytes) {
+      if (bytes < 1024) return bytes + ' B';
+      if (bytes < 1024 * 1024) return (bytes / 1024).toFixed(1) + ' KB';
+      return (bytes / 1024 / 1024).toFixed(1) + ' MB';
+    }
+
+    function makeData(size) {
+      const data = new Uint8Array(size);
+      for (let i = 0; i < size; i++) data[i] = i & 0xFF;
+      return data;
+    }
+
+    // System info
+    document.getElementById('info-browser').textContent = navigator.userAgent;
+    document.getElementById('info-cores').textContent =
+      (navigator.hardwareConcurrency || 'unknown') + ' logical cores';
+
+    // Test config
+    const TEST_SIZES = [0, 500, 1024, 1025, 2048, 3072, 4096, 10240, 102400, 1048576];
+    const hwc = navigator.hardwareConcurrency || 4;
+    const WORKER_CONFIGS = [...new Set([1, 4, hwc])].sort((a, b) => a - b);
+
+    const tbody = document.getElementById('test-body');
+    const summary = document.getElementById('summary');
+
+    // Pre-populate table rows
+    const testRows = [];
+    for (const size of TEST_SIZES) {
+      for (const workers of WORKER_CONFIGS) {
+        const tr = document.createElement('tr');
+        tr.className = 'running';
+        tr.innerHTML = `
+          <td>...</td>
+          <td>${formatSize(size)}</td>
+          <td>${workers}</td>
+          <td class="hash">-</td>
+          <td class="hash">-</td>
+          <td class="time">-</td>
+          <td class="match">-</td>
+        `;
+        tbody.appendChild(tr);
+        testRows.push({ tr, size, workers });
+      }
+    }
+
+    async function runTests() {
+      summary.textContent = 'Initializing WASM...';
+
+      // Init main-thread WASM for hash_single reference
+      await wasmInit();
+
+      let passed = 0;
+      let failed = 0;
+      let total = testRows.length;
+
+      // Group tests by worker count to reuse StreamingHasher instances
+      const byWorkers = new Map();
+      for (let i = 0; i < testRows.length; i++) {
+        const { workers } = testRows[i];
+        if (!byWorkers.has(workers)) byWorkers.set(workers, []);
+        byWorkers.get(workers).push(i);
+      }
+
+      for (const [workerCount, indices] of byWorkers) {
+        summary.textContent = `Testing with ${workerCount} worker(s)... (${passed + failed}/${total})`;
+
+        const hasher = new StreamingHasher(workerCount);
+        try {
+          await hasher.init();
+        } catch (err) {
+          for (const idx of indices) {
+            const { tr } = testRows[idx];
+            tr.className = 'fail';
+            const cells = tr.querySelectorAll('td');
+            cells[0].textContent = 'FAIL';
+            cells[6].textContent = 'Init error: ' + err.message;
+            cells[6].className = 'match no';
+            failed++;
+          }
+          continue;
+        }
+
+        for (const idx of indices) {
+          const { tr, size } = testRows[idx];
+          const cells = tr.querySelectorAll('td');
+
+          try {
+            const data = makeData(size);
+            const expectedHash = hash_single(data);
+            const expectedHex = toHex(expectedHash);
+            cells[3].textContent = expectedHex.slice(0, 16) + '...';
+            cells[3].title = expectedHex;
+
+            const blob = new Blob([data]);
+            const { hash: streamingHash, timeMs } = await hasher.hashFile(blob);
+            const gotHex = toHex(streamingHash);
+            cells[4].textContent = gotHex.slice(0, 16) + '...';
+            cells[4].title = gotHex;
+            cells[5].textContent = timeMs.toFixed(1) + ' ms';
+
+            const match = expectedHex === gotHex;
+            if (match) {
+              tr.className = 'pass';
+              cells[0].textContent = 'PASS';
+              cells[6].textContent = 'YES';
+              cells[6].className = 'match yes';
+              passed++;
+            } else {
+              tr.className = 'fail';
+              cells[0].textContent = 'FAIL';
+              cells[6].textContent = 'NO';
+              cells[6].className = 'match no';
+              failed++;
+            }
+          } catch (err) {
+            tr.className = 'fail';
+            const cells = tr.querySelectorAll('td');
+            cells[0].textContent = 'FAIL';
+            cells[4].textContent = err.message;
+            cells[6].textContent = 'ERROR';
+            cells[6].className = 'match no';
+            failed++;
+          }
+
+          summary.textContent = `Testing with ${workerCount} worker(s)... (${passed + failed}/${total})`;
+        }
+
+        hasher.terminate();
+      }
+
+      if (failed === 0) {
+        summary.textContent = `All ${passed} tests passed!`;
+        summary.className = 'summary pass';
+      } else {
+        summary.textContent = `${failed} of ${total} tests failed.`;
+        summary.className = 'summary fail';
+      }
+    }
+
+    // Manual file test
+    const fileArea = document.getElementById('file-area');
+    const fileInput = document.getElementById('file-input');
+
+    fileArea.addEventListener('click', () => fileInput.click());
+    fileInput.addEventListener('change', (e) => {
+      if (e.target.files[0]) testFile(e.target.files[0]);
+    });
+    fileArea.addEventListener('dragover', (e) => {
+      e.preventDefault();
+      fileArea.classList.add('dragover');
+    });
+    fileArea.addEventListener('dragleave', () => fileArea.classList.remove('dragover'));
+    fileArea.addEventListener('drop', (e) => {
+      e.preventDefault();
+      fileArea.classList.remove('dragover');
+      if (e.dataTransfer.files[0]) testFile(e.dataTransfer.files[0]);
+    });
+
+    async function testFile(file) {
+      const results = document.getElementById('manual-results');
+      results.style.display = 'block';
+
+      document.getElementById('mr-file').textContent = `${file.name} (${formatSize(file.size)})`;
+      document.getElementById('mr-streaming-hash').textContent = 'Hashing...';
+      document.getElementById('mr-single-hash').textContent = 'Hashing...';
+      document.getElementById('mr-match').textContent = '-';
+      document.getElementById('mr-match').className = 'value match-status';
+
+      const hasher = new StreamingHasher();
+      await hasher.init();
+
+      const { hash: streamingHash, timeMs: streamingTime } = await hasher.hashFile(file);
+      const streamingHex = toHex(streamingHash);
+      document.getElementById('mr-streaming-hash').textContent = streamingHex;
+      document.getElementById('mr-streaming-time').textContent = streamingTime.toFixed(1) + ' ms';
+
+      hasher.terminate();
+
+      const buf = await file.arrayBuffer();
+      const data = new Uint8Array(buf);
+      const t0 = performance.now();
+      const singleHash = hash_single(data);
+      const singleTime = performance.now() - t0;
+      const singleHex = toHex(singleHash);
+      document.getElementById('mr-single-hash').textContent = singleHex;
+      document.getElementById('mr-single-time').textContent = singleTime.toFixed(1) + ' ms';
+
+      const match = streamingHex === singleHex;
+      const el = document.getElementById('mr-match');
+      el.textContent = match ? 'MATCH' : 'MISMATCH';
+      el.className = 'value match-status ' + (match ? 'yes' : 'no');
+    }
+
+    // Run on load
+    runTests();
+  </script>
+</body>
+</html>
