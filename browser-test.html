@@ -264,10 +264,14 @@
     // ============================================================
     // GLOBAL STATE
     // ============================================================
-    let blake3Hash = null;
+    let blake3HashSingle = null;    // always loaded
+    let blake3HashParallel = null;  // loaded if SAB available
     let isReady = false;
-    let isParallel = false;
+    let parallelAvailable = false;
+    let isAutoMode = false;
     let activeThreadCount = 0;
+    let autoParallelThreads = 0;
+    const AUTO_THRESHOLD = 10 * 1024 * 1024;  // 10 MB
 
     // ============================================================
     // INITIALIZATION
@@ -276,14 +280,35 @@
       const status = document.getElementById('status');
       const blake3Title = document.getElementById('blake3-title');
       const modeBanner = document.getElementById('mode-banner');
+
+      const params = new URLSearchParams(window.location.hash.slice(1));
+      const raw = params.get('threads');
+      isAutoMode = (raw === null || raw === 'auto');
       const threadCount = getRequestedThreads();
 
       console.log('[BLAKE3] SharedArrayBuffer:', hasSAB);
       console.log('[BLAKE3] crossOriginIsolated:', self.crossOriginIsolated);
-      console.log('[BLAKE3] Requested threads:', threadCount);
+      console.log('[BLAKE3] Mode:', isAutoMode ? 'auto' : `manual (${threadCount} threads)`);
 
-      // --- Try parallel mode if threads > 1 and SharedArrayBuffer available ---
-      if (threadCount > 1 && hasSAB) {
+      // --- Step 1: Always load single-threaded build ---
+      try {
+        const module = await import('./blake3-wasm-single/pkg/blake3_wasm_single.js');
+        const wasmResponse = await fetch('./blake3-wasm-single/pkg/blake3_wasm_single_bg.wasm');
+        const wasmBytes = await wasmResponse.arrayBuffer();
+        const wasmModule = await WebAssembly.compile(wasmBytes);
+        await module.default(wasmModule);
+        blake3HashSingle = (data) => module.hash(data);
+        console.log('[BLAKE3] Single-threaded build loaded');
+      } catch (err) {
+        status.textContent = 'Unable to load BLAKE3 module. Please try refreshing.';
+        status.style.color = '#f87171';
+        console.error('[BLAKE3] Single-threaded init failed:', err);
+        return;
+      }
+
+      // --- Step 2: Try parallel build if applicable ---
+      const parallelThreads = isAutoMode ? Math.min(3, cpuCores) : threadCount;
+      if (parallelThreads > 1 && hasSAB) {
         try {
           const parallelInit = async () => {
             const mod = await import('./blake3-wasm-rayon/pkg/blake3_wasm_rayon.js');
@@ -291,62 +316,63 @@
             const wasmBytes = await wasmResponse.arrayBuffer();
             const wasmModule = await WebAssembly.compile(wasmBytes);
             await mod.default({ module_or_path: wasmModule });
-            await mod.initThreadPool(threadCount);
+            await mod.initThreadPool(parallelThreads);
             return mod;
           };
           const timeout = new Promise((_, reject) =>
             setTimeout(() => reject(new Error('Parallel init timeout (5s)')), 5000)
           );
           const mod = await Promise.race([parallelInit(), timeout]);
+          blake3HashParallel = (data) => mod.hash(data);
+          parallelAvailable = true;
+          autoParallelThreads = parallelThreads;
+          console.log(`[BLAKE3] Parallel build loaded (${parallelThreads} threads)`);
+        } catch (err) {
+          console.warn('[BLAKE3] Parallel init failed:', err.message);
+        }
+      }
 
-          blake3Hash = (data) => mod.hash(data);
-          isParallel = true;
-          isReady = true;
-          activeThreadCount = threadCount;
+      // --- Step 3: Set ready state and UI ---
+      isReady = true;
 
-          blake3Title.textContent = `WASM BLAKE3 (${threadCount} threads)`;
-          status.textContent = `Ready! Parallel mode (${threadCount} threads).`;
+      if (isAutoMode) {
+        if (parallelAvailable) {
+          blake3Title.textContent = 'WASM BLAKE3 (auto)';
+          status.textContent = `Ready! Auto mode \u2014 single (<10 MB) or parallel ${autoParallelThreads} threads (\u226510 MB)`;
           status.style.color = '#4ade80';
-          modeBanner.textContent = `Parallel mode \u2014 ${threadCount} threads (SharedArrayBuffer + Web Workers)`;
+          modeBanner.textContent = `Auto mode \u2014 single + parallel (${autoParallelThreads} threads) available`;
           modeBanner.style.background = '#1a3a1a';
           modeBanner.style.color = '#4ade80';
           document.getElementById('info-mode').textContent =
-            `Parallel (${threadCount} threads, SharedArrayBuffer + Web Workers)`;
-          console.log(`[BLAKE3] Initialized: parallel mode (${threadCount} threads)`);
-        } catch (err) {
-          console.warn('[BLAKE3] Parallel mode failed:', err.message);
-        }
-      } else if (threadCount > 1) {
-        console.warn('[BLAKE3] SharedArrayBuffer unavailable — falling back to single-threaded');
-      }
-
-      // --- Single-threaded fallback (always works) ---
-      if (!isReady) {
-        try {
-          const module = await import('./blake3-wasm-single/pkg/blake3_wasm_single.js');
-          const wasmResponse = await fetch('./blake3-wasm-single/pkg/blake3_wasm_single_bg.wasm');
-          const wasmBytes = await wasmResponse.arrayBuffer();
-          const wasmModule = await WebAssembly.compile(wasmBytes);
-          await module.default(wasmModule);
-
-          blake3Hash = (data) => module.hash(data);
-          isParallel = false;
-          isReady = true;
-          activeThreadCount = 1;
-
+            `Auto (single + parallel ${autoParallelThreads} threads)`;
+        } else {
           blake3Title.textContent = 'WASM BLAKE3 (single-threaded)';
-          status.textContent = 'Ready! Single-threaded mode.';
+          status.textContent = 'Ready! Auto mode \u2014 single-threaded only.';
           status.style.color = '#fbbf24';
-          modeBanner.textContent = 'Single-threaded mode (WASM SIMD)';
+          modeBanner.textContent = 'Auto mode \u2014 single-threaded (WASM SIMD)';
           modeBanner.style.background = '#3a2a1a';
           modeBanner.style.color = '#fbbf24';
-          document.getElementById('info-mode').textContent = 'Single-threaded (WASM SIMD)';
-          console.log('[BLAKE3] Initialized: single-threaded mode');
-        } catch (err) {
-          status.textContent = 'Unable to load BLAKE3 module. Please try refreshing.';
-          status.style.color = '#f87171';
-          console.error('[BLAKE3] All init paths failed:', err);
+          document.getElementById('info-mode').textContent = 'Auto (single-threaded only)';
         }
+      } else if (parallelAvailable && threadCount > 1) {
+        activeThreadCount = threadCount;
+        blake3Title.textContent = `WASM BLAKE3 (${threadCount} threads)`;
+        status.textContent = `Ready! Parallel mode (${threadCount} threads).`;
+        status.style.color = '#4ade80';
+        modeBanner.textContent = `Parallel mode \u2014 ${threadCount} threads (SharedArrayBuffer + Web Workers)`;
+        modeBanner.style.background = '#1a3a1a';
+        modeBanner.style.color = '#4ade80';
+        document.getElementById('info-mode').textContent =
+          `Parallel (${threadCount} threads, SharedArrayBuffer + Web Workers)`;
+      } else {
+        activeThreadCount = 1;
+        blake3Title.textContent = 'WASM BLAKE3 (single-threaded)';
+        status.textContent = 'Ready! Single-threaded mode.';
+        status.style.color = '#fbbf24';
+        modeBanner.textContent = 'Single-threaded mode (WASM SIMD)';
+        modeBanner.style.background = '#3a2a1a';
+        modeBanner.style.color = '#fbbf24';
+        document.getElementById('info-mode').textContent = 'Single-threaded (WASM SIMD)';
       }
     }
 
@@ -420,9 +446,32 @@
       const arrayBuffer = await file.arrayBuffer();
       const data = new Uint8Array(arrayBuffer);
 
+      // --- Choose hash function based on mode ---
+      let hashFn, modeStr;
+      if (isAutoMode) {
+        if (file.size >= AUTO_THRESHOLD && parallelAvailable) {
+          hashFn = blake3HashParallel;
+          activeThreadCount = autoParallelThreads;
+          modeStr = `Auto \u2192 parallel ${autoParallelThreads} threads (file \u2265 10 MB)`;
+          document.getElementById('blake3-title').textContent = `WASM BLAKE3 (${autoParallelThreads} threads)`;
+        } else {
+          hashFn = blake3HashSingle;
+          activeThreadCount = 1;
+          modeStr = file.size < AUTO_THRESHOLD
+            ? 'Auto \u2192 single-threaded (file < 10 MB)'
+            : 'Auto \u2192 single-threaded (parallel unavailable)';
+          document.getElementById('blake3-title').textContent = 'WASM BLAKE3 (single-threaded)';
+        }
+      } else {
+        hashFn = activeThreadCount > 1 && parallelAvailable ? blake3HashParallel : blake3HashSingle;
+        modeStr = activeThreadCount > 1
+          ? `Parallel (${activeThreadCount} threads)`
+          : 'Single-threaded (SIMD)';
+      }
+
       // --- BLAKE3 ---
       const blake3Start = performance.now();
-      const blake3HashResult = blake3Hash(data);
+      const blake3HashResult = hashFn(data);
       const blake3Time = performance.now() - blake3Start;
       const blake3Speed = (file.size / 1024 / 1024) / (blake3Time / 1000);
 
@@ -460,9 +509,6 @@
 
       // Show always-visible metadata bar
       const meta = document.getElementById('benchmark-meta');
-      const modeStr = isParallel
-        ? `BLAKE3 parallel (${activeThreadCount} threads)`
-        : 'BLAKE3 single-threaded (SIMD)';
       meta.innerHTML = [
         modeStr,
         `${cpuCores} cores`,
