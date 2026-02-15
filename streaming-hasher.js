@@ -93,6 +93,7 @@ export class StreamingHasher {
 
     // Empty or single-chunk: hash on main thread
     if (len <= CHUNK_SIZE) {
+      console.log(`[StreamingHasher] len=${len} <= ${CHUNK_SIZE}, using hash_single on main thread`);
       const data = new Uint8Array(buffer);
       const hash = hash_single(data);
       return { hash, timeMs: performance.now() - t0 };
@@ -101,15 +102,28 @@ export class StreamingHasher {
     // Build merge tree
     const tree = this.#buildTree(0, len, this.#numWorkers);
 
+    // If tree is a single leaf (1 worker, entire file), hash_subtree returns
+    // a non-root CV — root finalization would never be applied. Fall back to
+    // hash_single which correctly produces the final BLAKE3 hash.
+    if (tree.type === 'leaf') {
+      console.log(`[StreamingHasher] single leaf (len=${len}, workers=${this.#numWorkers}), using hash_single on main thread`);
+      const data = new Uint8Array(buffer);
+      const hash = hash_single(data);
+      return { hash, timeMs: performance.now() - t0 };
+    }
+
     // Collect leaf nodes
     const leaves = [];
     this.#collectLeaves(tree, leaves);
+    console.log(`[StreamingHasher] len=${len}, workers=${this.#numWorkers}, leaves=${leaves.length}, tree splits:`);
+    for (const leaf of leaves) {
+      console.log(`  leaf[${leaf.index}]: offset=${leaf.offset}, len=${leaf.len}`);
+    }
 
     // Dispatch each leaf to a worker
     const cvPromises = new Array(leaves.length);
     for (let i = 0; i < leaves.length; i++) {
       const leaf = leaves[i];
-      leaf.index = i;
       const workerIdx = i % this.#numWorkers;
       cvPromises[i] = this.#dispatchToWorker(workerIdx, buffer, leaf.offset, leaf.len);
     }
@@ -118,6 +132,7 @@ export class StreamingHasher {
 
     // Merge CVs according to tree structure
     const finalHash = this.#mergeTree(tree, cvResults, true);
+    console.log(`[StreamingHasher] done in ${(performance.now() - t0).toFixed(1)}ms`);
     return { hash: finalHash, timeMs: performance.now() - t0 };
   }
 
@@ -130,6 +145,8 @@ export class StreamingHasher {
     const rightLen = len - leftLen;
     const leftWorkers = Math.max(1, Math.min(maxLeaves - 1, Math.round(maxLeaves * leftLen / len)));
     const rightWorkers = maxLeaves - leftWorkers;
+
+    console.log(`[buildTree] split offset=${offset} len=${len}: left=${leftLen}(${leftWorkers}w) right=${rightLen}(${rightWorkers}w)`);
 
     return {
       type: 'node',
@@ -173,7 +190,10 @@ export class StreamingHasher {
 
     const leftCV = this.#mergeTree(node.left, cvs, false);
     const rightCV = this.#mergeTree(node.right, cvs, false);
-    return isRoot ? root_hash(leftCV, rightCV) : parent_cv(leftCV, rightCV);
+    const fn = isRoot ? 'root_hash' : 'parent_cv';
+    const result = isRoot ? root_hash(leftCV, rightCV) : parent_cv(leftCV, rightCV);
+    console.log(`[mergeTree] ${fn}(left, right) isRoot=${isRoot}`);
+    return result;
   }
 
   terminate() {
