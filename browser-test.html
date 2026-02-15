@@ -225,14 +225,24 @@
     const cpuCores = navigator.hardwareConcurrency || 4;
     const hasSAB = typeof SharedArrayBuffer !== 'undefined';
 
+    // Returns 'streaming-N' string for streaming modes, number for rayon/single, cpuCores for auto
     function getRequestedThreads() {
       const params = new URLSearchParams(window.location.hash.slice(1));
       const raw = params.get('threads');
-      if (raw === 'streaming') return 'streaming';
+      if (raw && raw.startsWith('streaming')) return raw;  // 'streaming-1', 'streaming-3', etc.
       if (raw === null || raw === 'auto') return cpuCores;
       const val = parseInt(raw, 10);
       if (val >= 1 && val <= 16) return val;
       return cpuCores;
+    }
+
+    // Parse 'streaming-3' → 3, or null if not a streaming value
+    function parseStreamingCount(value) {
+      if (typeof value === 'string' && value.startsWith('streaming-')) {
+        const n = parseInt(value.split('-')[1], 10);
+        if (n >= 1 && n <= 16) return n;
+      }
+      return null;
     }
 
     function populateThreadSelector() {
@@ -242,10 +252,16 @@
       const requested = getRequestedThreads();
       const isExplicit = params.has('threads') && raw !== 'auto';
 
-      const streamWorkerCount = Math.min(3, cpuCores);
       const options = [
-        { value: 'auto',      label: `Auto (${cpuCores} cores)` },
-        { value: 'streaming', label: `Streaming (${streamWorkerCount} workers)` },
+        { value: 'auto', label: `Auto (${cpuCores} cores)` },
+        // Streaming options (no SAB needed)
+        { value: 'streaming-1', label: 'Streaming (1 worker)' },
+        { value: 'streaming-2', label: 'Streaming (2 workers)' },
+        { value: 'streaming-3', label: 'Streaming (3 workers)' },
+        { value: 'streaming-4', label: 'Streaming (4 workers)' },
+        { value: 'streaming-6', label: 'Streaming (6 workers)' },
+        { value: 'streaming-8', label: 'Streaming (8 workers)' },
+        // Rayon thread options (need SAB)
         { value: '1',    label: '1 thread' },
         { value: '2',    label: '2 threads' },
         { value: '3',    label: '3 threads' },
@@ -263,16 +279,16 @@
         const numVal = parseInt(opt.value, 10);
 
         // Rayon thread options (2-10) need SAB
-        if (!hasSAB && numVal > 1) {
+        if (!opt.value.startsWith('streaming') && !hasSAB && numVal > 1) {
           el.textContent += ' (unavailable)';
           el.disabled = true;
         }
 
         if (!isExplicit && opt.value === 'auto') {
           el.selected = true;
-        } else if (raw === 'streaming' && opt.value === 'streaming') {
+        } else if (raw && raw.startsWith('streaming') && opt.value === raw) {
           el.selected = true;
-        } else if (isExplicit && raw !== 'streaming' && numVal === requested) {
+        } else if (isExplicit && !raw.startsWith('streaming') && numVal === requested) {
           el.selected = true;
         }
 
@@ -317,12 +333,13 @@
       const params = new URLSearchParams(window.location.hash.slice(1));
       const raw = params.get('threads');
       isAutoMode = (raw === null || raw === 'auto');
-      isStreamingMode = (raw === 'streaming');
+      isStreamingMode = (raw !== null && raw.startsWith('streaming'));
       const threadCount = getRequestedThreads();
+      const explicitStreamWorkers = parseStreamingCount(threadCount);
 
       console.log('[BLAKE3] SharedArrayBuffer:', hasSAB);
       console.log('[BLAKE3] crossOriginIsolated:', self.crossOriginIsolated);
-      console.log('[BLAKE3] Mode:', isAutoMode ? 'auto' : isStreamingMode ? 'streaming' : `manual (${threadCount} threads)`);
+      console.log('[BLAKE3] Mode:', isAutoMode ? 'auto' : isStreamingMode ? `streaming (${explicitStreamWorkers} workers)` : `manual (${threadCount} threads)`);
 
       // --- Step 1: Always load single-threaded build ---
       try {
@@ -342,6 +359,7 @@
 
       // --- Step 2: Try parallel build if applicable ---
       const parallelThreads = isAutoMode ? Math.min(3, cpuCores) : (typeof threadCount === 'number' ? threadCount : 1);
+      // Note: when isStreamingMode, parallelThreads will be 1, so rayon init is skipped
       if (parallelThreads > 1 && hasSAB) {
         try {
           const parallelInit = async () => {
@@ -367,8 +385,9 @@
       }
 
       // --- Step 2.5: Init streaming worker hasher ---
+      // Explicit streaming-N uses that count; auto mode defaults to min(3, cores)
       try {
-        const streamWorkers = Math.min(3, cpuCores);
+        const streamWorkers = explicitStreamWorkers || Math.min(3, cpuCores);
         streamingHasher = new StreamingHasher(streamWorkers);
         await streamingHasher.init();
         streamingAvailable = true;
