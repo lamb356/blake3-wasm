@@ -105,6 +105,22 @@
     .manual-results .match-status.yes { color: #4ade80; }
     .manual-results .match-status.no { color: #f87171; }
 
+    .progress-bar {
+      background: #1a1a2e;
+      border-radius: 6px;
+      height: 16px;
+      overflow: hidden;
+      margin-top: 2px;
+      width: 100%;
+    }
+    .progress-fill {
+      background: #4ade80;
+      height: 100%;
+      width: 0%;
+      transition: width 0.15s ease;
+      border-radius: 6px;
+    }
+
     .system-info {
       background: #252540;
       border-radius: 8px;
@@ -129,7 +145,23 @@
 
   <div id="summary" class="summary running">Initializing...</div>
 
-  <h2>Automated Tests</h2>
+  <h2>hashFile Tests</h2>
+  <table>
+    <thead>
+      <tr>
+        <th>Status</th>
+        <th>Size</th>
+        <th>Workers</th>
+        <th>Expected (hash_single)</th>
+        <th>Got (hashFile)</th>
+        <th>Time</th>
+        <th>Match</th>
+      </tr>
+    </thead>
+    <tbody id="test-body"></tbody>
+  </table>
+
+  <h2>hashFileStreaming Tests</h2>
   <table>
     <thead>
       <tr>
@@ -142,7 +174,7 @@
         <th>Match</th>
       </tr>
     </thead>
-    <tbody id="test-body"></tbody>
+    <tbody id="stream-test-body"></tbody>
   </table>
 
   <h2>Manual File Test</h2>
@@ -157,20 +189,34 @@
       <span class="value" id="mr-file">-</span>
     </div>
     <div class="row">
-      <span class="label">Streaming hash</span>
-      <span class="value" id="mr-streaming-hash">-</span>
-    </div>
-    <div class="row">
-      <span class="label">Streaming time</span>
-      <span class="value" id="mr-streaming-time">-</span>
-    </div>
-    <div class="row">
       <span class="label">hash_single</span>
       <span class="value" id="mr-single-hash">-</span>
     </div>
     <div class="row">
       <span class="label">hash_single time</span>
       <span class="value" id="mr-single-time">-</span>
+    </div>
+    <div class="row">
+      <span class="label">hashFile</span>
+      <span class="value" id="mr-streaming-hash">-</span>
+    </div>
+    <div class="row">
+      <span class="label">hashFile time</span>
+      <span class="value" id="mr-streaming-time">-</span>
+    </div>
+    <div class="row">
+      <span class="label">hashFileStreaming</span>
+      <span class="value" id="mr-stream-hash">-</span>
+    </div>
+    <div class="row">
+      <span class="label">hashFileStreaming time</span>
+      <span class="value" id="mr-stream-time">-</span>
+    </div>
+    <div class="row">
+      <span class="label">Streaming progress</span>
+      <span class="value" style="flex: 1; margin-left: 10px;">
+        <div class="progress-bar"><div class="progress-fill" id="mr-progress"></div></div>
+      </span>
     </div>
     <div class="row">
       <span class="label">Match</span>
@@ -216,9 +262,10 @@
     const WORKER_CONFIGS = [...new Set([1, 4, hwc])].sort((a, b) => a - b);
 
     const tbody = document.getElementById('test-body');
+    const streamTbody = document.getElementById('stream-test-body');
     const summary = document.getElementById('summary');
 
-    // Pre-populate table rows
+    // Pre-populate hashFile test rows
     const testRows = [];
     for (const size of TEST_SIZES) {
       for (const workers of WORKER_CONFIGS) {
@@ -238,6 +285,26 @@
       }
     }
 
+    // Pre-populate hashFileStreaming test rows
+    const streamTestRows = [];
+    for (const size of TEST_SIZES) {
+      for (const workers of WORKER_CONFIGS) {
+        const tr = document.createElement('tr');
+        tr.className = 'running';
+        tr.innerHTML = `
+          <td>...</td>
+          <td>${formatSize(size)}</td>
+          <td>${workers}</td>
+          <td class="hash">-</td>
+          <td class="hash">-</td>
+          <td class="time">-</td>
+          <td class="match">-</td>
+        `;
+        streamTbody.appendChild(tr);
+        streamTestRows.push({ tr, size, workers });
+      }
+    }
+
     async function runTests() {
       summary.textContent = 'Initializing WASM...';
 
@@ -246,9 +313,9 @@
 
       let passed = 0;
       let failed = 0;
-      let total = testRows.length;
+      const total = testRows.length + streamTestRows.length;
 
-      // Group tests by worker count to reuse StreamingHasher instances
+      // --- hashFile tests ---
       const byWorkers = new Map();
       for (let i = 0; i < testRows.length; i++) {
         const { workers } = testRows[i];
@@ -257,7 +324,7 @@
       }
 
       for (const [workerCount, indices] of byWorkers) {
-        summary.textContent = `Testing with ${workerCount} worker(s)... (${passed + failed}/${total})`;
+        summary.textContent = `hashFile: ${workerCount} worker(s)... (${passed + failed}/${total})`;
 
         const hasher = new StreamingHasher(workerCount);
         try {
@@ -317,7 +384,82 @@
             failed++;
           }
 
-          summary.textContent = `Testing with ${workerCount} worker(s)... (${passed + failed}/${total})`;
+          summary.textContent = `hashFile: ${workerCount} worker(s)... (${passed + failed}/${total})`;
+        }
+
+        hasher.terminate();
+      }
+
+      // --- hashFileStreaming tests ---
+      const byWorkersStream = new Map();
+      for (let i = 0; i < streamTestRows.length; i++) {
+        const { workers } = streamTestRows[i];
+        if (!byWorkersStream.has(workers)) byWorkersStream.set(workers, []);
+        byWorkersStream.get(workers).push(i);
+      }
+
+      for (const [workerCount, indices] of byWorkersStream) {
+        summary.textContent = `hashFileStreaming: ${workerCount} worker(s)... (${passed + failed}/${total})`;
+
+        const hasher = new StreamingHasher(workerCount);
+        try {
+          await hasher.init();
+        } catch (err) {
+          for (const idx of indices) {
+            const { tr } = streamTestRows[idx];
+            tr.className = 'fail';
+            const cells = tr.querySelectorAll('td');
+            cells[0].textContent = 'FAIL';
+            cells[6].textContent = 'Init error: ' + err.message;
+            cells[6].className = 'match no';
+            failed++;
+          }
+          continue;
+        }
+
+        for (const idx of indices) {
+          const { tr, size } = streamTestRows[idx];
+          const cells = tr.querySelectorAll('td');
+
+          try {
+            const data = makeData(size);
+            const expectedHash = hash_single(data);
+            const expectedHex = toHex(expectedHash);
+            cells[3].textContent = expectedHex.slice(0, 16) + '...';
+            cells[3].title = expectedHex;
+
+            const blob = new Blob([data]);
+            const { hash: streamHash, timeMs } = await hasher.hashFileStreaming(blob);
+            const gotHex = toHex(streamHash);
+            cells[4].textContent = gotHex.slice(0, 16) + '...';
+            cells[4].title = gotHex;
+            cells[5].textContent = timeMs.toFixed(1) + ' ms';
+
+            const match = expectedHex === gotHex;
+            if (match) {
+              tr.className = 'pass';
+              cells[0].textContent = 'PASS';
+              cells[6].textContent = 'YES';
+              cells[6].className = 'match yes';
+              passed++;
+            } else {
+              tr.className = 'fail';
+              cells[0].textContent = 'FAIL';
+              cells[6].textContent = 'NO';
+              cells[6].className = 'match no';
+              failed++;
+            }
+          } catch (err) {
+            tr.className = 'fail';
+            const cells = tr.querySelectorAll('td');
+            cells[0].textContent = 'FAIL';
+            cells[4].textContent = err.message;
+            cells[6].textContent = 'ERROR';
+            cells[6].className = 'match no';
+            failed++;
+          }
+
+          summary.textContent = `hashFileStreaming: ${workerCount} worker(s)... (${passed + failed}/${total})`;
         }
 
         hasher.terminate();
@@ -356,21 +498,36 @@
       results.style.display = 'block';
 
       document.getElementById('mr-file').textContent = `${file.name} (${formatSize(file.size)})`;
-      document.getElementById('mr-streaming-hash').textContent = 'Hashing...';
       document.getElementById('mr-single-hash').textContent = 'Hashing...';
+      document.getElementById('mr-streaming-hash').textContent = 'Hashing...';
+      document.getElementById('mr-stream-hash').textContent = 'Hashing...';
       document.getElementById('mr-match').textContent = '-';
       document.getElementById('mr-match').className = 'value match-status';
+      document.getElementById('mr-progress').style.width = '0%';
 
       const hasher = new StreamingHasher();
       await hasher.init();
 
-      const { hash: streamingHash, timeMs: streamingTime } = await hasher.hashFile(file);
-      const streamingHex = toHex(streamingHash);
-      document.getElementById('mr-streaming-hash').textContent = streamingHex;
-      document.getElementById('mr-streaming-time').textContent = streamingTime.toFixed(1) + ' ms';
+      // hashFile
+      const { hash: hashFileResult, timeMs: hashFileTime } = await hasher.hashFile(file);
+      const hashFileHex = toHex(hashFileResult);
+      document.getElementById('mr-streaming-hash').textContent = hashFileHex;
+      document.getElementById('mr-streaming-time').textContent = hashFileTime.toFixed(1) + ' ms';
+
+      // hashFileStreaming with progress
+      const progressEl = document.getElementById('mr-progress');
+      const { hash: streamHash, timeMs: streamTime } = await hasher.hashFileStreaming(file, ({ bytesRead, totalBytes }) => {
+        const pct = totalBytes > 0 ? Math.round((bytesRead / totalBytes) * 100) : 100;
+        progressEl.style.width = pct + '%';
+      });
+      const streamHex = toHex(streamHash);
+      document.getElementById('mr-stream-hash').textContent = streamHex;
+      document.getElementById('mr-stream-time').textContent = streamTime.toFixed(1) + ' ms';
+      progressEl.style.width = '100%';
 
       hasher.terminate();
 
+      // hash_single
       const buf = await file.arrayBuffer();
       const data = new Uint8Array(buf);
       const t0 = performance.now();
@@ -380,10 +537,10 @@
       document.getElementById('mr-single-hash').textContent = singleHex;
       document.getElementById('mr-single-time').textContent = singleTime.toFixed(1) + ' ms';
 
-      const match = streamingHex === singleHex;
+      const allMatch = hashFileHex === singleHex && streamHex === singleHex;
       const el = document.getElementById('mr-match');
-      el.textContent = match ? 'MATCH' : 'MISMATCH';
-      el.className = 'value match-status ' + (match ? 'yes' : 'no');
+      el.textContent = allMatch ? 'ALL MATCH' : 'MISMATCH';
+      el.className = 'value match-status ' + (allMatch ? 'yes' : 'no');
     }
 
     // Run on load

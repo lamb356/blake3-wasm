@@ -136,6 +136,100 @@ export class StreamingHasher {
     return { hash: finalHash, timeMs: performance.now() - t0 };
   }
 
+  async hashFileStreaming(file, onProgress) {
+    if (!this.#initialized) throw new Error('StreamingHasher not initialized. Call init() first.');
+
+    const t0 = performance.now();
+    const totalBytes = file.size;
+
+    // Empty or single-chunk: hash on main thread (no streaming benefit)
+    if (totalBytes <= CHUNK_SIZE) {
+      const buffer = await file.arrayBuffer();
+      const data = new Uint8Array(buffer);
+      const hash = hash_single(data);
+      if (onProgress) onProgress({ bytesRead: totalBytes, totalBytes, bytesHashed: totalBytes });
+      return { hash, timeMs: performance.now() - t0 };
+    }
+
+    // Build merge tree
+    const tree = this.#buildTree(0, totalBytes, this.#numWorkers);
+
+    // Single leaf: hash_single on main thread (same root-finalization fix as hashFile)
+    if (tree.type === 'leaf') {
+      console.log(`[StreamingHasher] streaming: single leaf (len=${totalBytes}, workers=${this.#numWorkers}), using hash_single`);
+      const buffer = await file.arrayBuffer();
+      const data = new Uint8Array(buffer);
+      const hash = hash_single(data);
+      if (onProgress) onProgress({ bytesRead: totalBytes, totalBytes, bytesHashed: totalBytes });
+      return { hash, timeMs: performance.now() - t0 };
+    }
+
+    // Collect leaf nodes (defines byte ranges)
+    const leaves = [];
+    this.#collectLeaves(tree, leaves);
+    console.log(`[StreamingHasher] streaming: len=${totalBytes}, workers=${this.#numWorkers}, leaves=${leaves.length}`);
+
+    // Allocate a buffer per leaf and prepare state
+    const leafBuffers = leaves.map(l => new ArrayBuffer(l.len));
+    const leafFilled = new Array(leaves.length).fill(0);
+    let currentLeafIdx = 0;
+    let bytesRead = 0;
+    let bytesHashed = 0;
+
+    const cvPromises = new Array(leaves.length);
+
+    // Stream loop
+    const reader = file.stream().getReader();
+    try {
+      while (true) {
+        const { done, value } = await reader.read();
+        if (done) break;
+
+        let chunkOffset = 0;
+        const chunk = value; // Uint8Array
+
+        while (chunkOffset < chunk.length && currentLeafIdx < leaves.length) {
+          const leaf = leaves[currentLeafIdx];
+          const remaining = leaf.len - leafFilled[currentLeafIdx];
+          const toCopy = Math.min(remaining, chunk.length - chunkOffset);
+
+          // Copy into the leaf buffer
+          const dest = new Uint8Array(leafBuffers[currentLeafIdx]);
+          dest.set(chunk.subarray(chunkOffset, chunkOffset + toCopy), leafFilled[currentLeafIdx]);
+          leafFilled[currentLeafIdx] += toCopy;
+          chunkOffset += toCopy;
+
+          // If leaf buffer is full, dispatch to worker
+          if (leafFilled[currentLeafIdx] === leaf.len) {
+            const workerIdx = currentLeafIdx % this.#numWorkers;
+            const leafIdx = currentLeafIdx;
+            const leafLen = leaf.len;
+            cvPromises[leafIdx] = this.#dispatchBuffer(workerIdx, leafBuffers[leafIdx], leaf.offset)
+              .then(cv => {
+                bytesHashed += leafLen;
+                if (onProgress) onProgress({ bytesRead, totalBytes, bytesHashed });
+                return cv;
+              });
+            currentLeafIdx++;
+          }
+        }
+
+        bytesRead += chunk.length;
+        if (onProgress) onProgress({ bytesRead, totalBytes, bytesHashed });
+      }
+    } finally {
+      reader.releaseLock();
+    }
+
+    // Wait for all workers to finish
+    const cvResults = await Promise.all(cvPromises);
+
+    // Merge CVs according to tree structure
+    const finalHash = this.#mergeTree(tree, cvResults, true);
+    console.log(`[StreamingHasher] streaming done in ${(performance.now() - t0).toFixed(1)}ms`);
+    return { hash: finalHash, timeMs: performance.now() - t0 };
+  }
+
   #buildTree(offset, len, maxLeaves) {
     if (maxLeaves <= 1 || len <= CHUNK_SIZE) {
       return { type: 'leaf', offset, len, index: -1 };
@@ -165,9 +259,8 @@ export class StreamingHasher {
     }
   }
 
-  #dispatchToWorker(workerIdx, buffer, offset, len) {
+  #dispatchBuffer(workerIdx, buffer, inputOffset) {
     const taskId = this.#nextTaskId++;
-    const slice = buffer.slice(offset, offset + len);
 
     return new Promise((resolve, reject) => {
       const timeout = setTimeout(() => {
@@ -177,10 +270,15 @@ export class StreamingHasher {
 
       this.#pendingTasks.set(taskId, { workerIndex: workerIdx, resolve, reject, timeout });
       this.#workers[workerIdx].postMessage(
-        { type: 'hash', data: slice, inputOffset: offset, taskId },
-        [slice]
+        { type: 'hash', data: buffer, inputOffset, taskId },
+        [buffer]
       );
     });
+  }
+
+  #dispatchToWorker(workerIdx, buffer, offset, len) {
+    const slice = buffer.slice(offset, offset + len);
+    return this.#dispatchBuffer(workerIdx, slice, offset);
   }
 
   #mergeTree(node, cvs, isRoot) {
