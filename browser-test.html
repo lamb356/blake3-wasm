@@ -560,6 +560,8 @@
         data = new Uint8Array(arrayBuffer);
       } else {
         // Standard path: read arrayBuffer, hash single/rayon, then SHA-256
+        // Timer includes I/O to match streaming mode's timeMs
+        const blake3Start = performance.now();
         const arrayBuffer = await file.arrayBuffer();
         data = new Uint8Array(arrayBuffer);
 
@@ -585,7 +587,6 @@
             : 'Single-threaded (SIMD)';
         }
 
-        const blake3Start = performance.now();
         blake3HashResult = hashFn(data);
         blake3Time = performance.now() - blake3Start;
       }
