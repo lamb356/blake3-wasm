@@ -58,6 +58,21 @@
       margin-top: 4px;
     }
 
+    .progress-bar {
+      background: #252540;
+      border-radius: 4px;
+      height: 6px;
+      overflow: hidden;
+      margin: -4px 0 10px 0;
+    }
+    .progress-fill {
+      background: #4ade80;
+      height: 100%;
+      width: 0%;
+      transition: width 0.1s ease;
+      border-radius: 4px;
+    }
+
     .results {
       display: grid;
       grid-template-columns: 1fr 1fr;
@@ -144,6 +159,11 @@
     <input type="file" id="file-input">
   </div>
 
+  <!-- Progress bar for streaming mode -->
+  <div class="progress-bar" id="progress-bar" style="display: none;">
+    <div class="progress-fill" id="progress-fill"></div>
+  </div>
+
   <!-- Side-by-side results -->
   <div class="results" id="results" style="display: none;">
     <div id="mode-banner" style="grid-column: 1 / -1; text-align: center; padding: 4px 12px; border-radius: 6px; font-size: 12px; font-weight: bold;"></div>
@@ -197,6 +217,8 @@
   </details>
 
   <script type="module">
+    import { StreamingHasher } from './streaming-hasher.js';
+
     // ============================================================
     // THREAD COUNT CONFIGURATION
     // ============================================================
@@ -206,6 +228,7 @@
     function getRequestedThreads() {
       const params = new URLSearchParams(window.location.hash.slice(1));
       const raw = params.get('threads');
+      if (raw === 'streaming') return 'streaming';
       if (raw === null || raw === 'auto') return cpuCores;
       const val = parseInt(raw, 10);
       if (val >= 1 && val <= 16) return val;
@@ -214,12 +237,15 @@
 
     function populateThreadSelector() {
       const select = document.getElementById('thread-select');
-      const requested = getRequestedThreads();
       const params = new URLSearchParams(window.location.hash.slice(1));
-      const isExplicit = params.has('threads') && params.get('threads') !== 'auto';
+      const raw = params.get('threads');
+      const requested = getRequestedThreads();
+      const isExplicit = params.has('threads') && raw !== 'auto';
 
+      const streamWorkerCount = Math.min(3, cpuCores);
       const options = [
-        { value: 'auto', label: `Auto (${cpuCores} cores)` },
+        { value: 'auto',      label: `Auto (${cpuCores} cores)` },
+        { value: 'streaming', label: `Streaming (${streamWorkerCount} workers)` },
         { value: '1',    label: '1 thread' },
         { value: '2',    label: '2 threads' },
         { value: '3',    label: '3 threads' },
@@ -236,6 +262,7 @@
         el.textContent = opt.label;
         const numVal = parseInt(opt.value, 10);
 
+        // Rayon thread options (2-10) need SAB
         if (!hasSAB && numVal > 1) {
           el.textContent += ' (unavailable)';
           el.disabled = true;
@@ -243,7 +270,9 @@
 
         if (!isExplicit && opt.value === 'auto') {
           el.selected = true;
-        } else if (isExplicit && numVal === requested) {
+        } else if (raw === 'streaming' && opt.value === 'streaming') {
+          el.selected = true;
+        } else if (isExplicit && raw !== 'streaming' && numVal === requested) {
           el.selected = true;
         }
 
@@ -266,11 +295,15 @@
     // ============================================================
     let blake3HashSingle = null;    // always loaded
     let blake3HashParallel = null;  // loaded if SAB available
+    let streamingHasher = null;     // StreamingHasher instance
     let isReady = false;
     let parallelAvailable = false;
+    let streamingAvailable = false;
     let isAutoMode = false;
+    let isStreamingMode = false;
     let activeThreadCount = 0;
     let autoParallelThreads = 0;
+    let streamingWorkerCount = 0;
     const AUTO_THRESHOLD = 10 * 1024 * 1024;  // 10 MB
 
     // ============================================================
@@ -284,11 +317,12 @@
       const params = new URLSearchParams(window.location.hash.slice(1));
       const raw = params.get('threads');
       isAutoMode = (raw === null || raw === 'auto');
+      isStreamingMode = (raw === 'streaming');
       const threadCount = getRequestedThreads();
 
       console.log('[BLAKE3] SharedArrayBuffer:', hasSAB);
       console.log('[BLAKE3] crossOriginIsolated:', self.crossOriginIsolated);
-      console.log('[BLAKE3] Mode:', isAutoMode ? 'auto' : `manual (${threadCount} threads)`);
+      console.log('[BLAKE3] Mode:', isAutoMode ? 'auto' : isStreamingMode ? 'streaming' : `manual (${threadCount} threads)`);
 
       // --- Step 1: Always load single-threaded build ---
       try {
@@ -307,7 +341,7 @@
       }
 
       // --- Step 2: Try parallel build if applicable ---
-      const parallelThreads = isAutoMode ? Math.min(3, cpuCores) : threadCount;
+      const parallelThreads = isAutoMode ? Math.min(3, cpuCores) : (typeof threadCount === 'number' ? threadCount : 1);
       if (parallelThreads > 1 && hasSAB) {
         try {
           const parallelInit = async () => {
@@ -332,11 +366,32 @@
         }
       }
 
+      // --- Step 2.5: Init streaming worker hasher ---
+      try {
+        const streamWorkers = Math.min(3, cpuCores);
+        streamingHasher = new StreamingHasher(streamWorkers);
+        await streamingHasher.init();
+        streamingAvailable = true;
+        streamingWorkerCount = streamWorkers;
+        console.log(`[BLAKE3] Streaming hasher loaded (${streamWorkers} workers)`);
+      } catch (err) {
+        console.warn('[BLAKE3] Streaming hasher init failed:', err.message);
+      }
+
       // --- Step 3: Set ready state and UI ---
       isReady = true;
 
       if (isAutoMode) {
-        if (parallelAvailable) {
+        if (streamingAvailable) {
+          blake3Title.textContent = 'WASM BLAKE3 (auto)';
+          status.textContent = `Ready! Auto mode \u2014 single (<10 MB) or streaming ${streamingWorkerCount} workers (\u226510 MB)`;
+          status.style.color = '#4ade80';
+          modeBanner.textContent = `Auto mode \u2014 single + streaming (${streamingWorkerCount} workers) available`;
+          modeBanner.style.background = '#1a3a1a';
+          modeBanner.style.color = '#4ade80';
+          document.getElementById('info-mode').textContent =
+            `Auto (single + streaming ${streamingWorkerCount} workers)`;
+        } else if (parallelAvailable) {
           blake3Title.textContent = 'WASM BLAKE3 (auto)';
           status.textContent = `Ready! Auto mode \u2014 single (<10 MB) or parallel ${autoParallelThreads} threads (\u226510 MB)`;
           status.style.color = '#4ade80';
@@ -354,6 +409,15 @@
           modeBanner.style.color = '#fbbf24';
           document.getElementById('info-mode').textContent = 'Auto (single-threaded only)';
         }
+      } else if (isStreamingMode && streamingAvailable) {
+        blake3Title.textContent = `WASM BLAKE3 (streaming ${streamingWorkerCount} workers)`;
+        status.textContent = `Ready! Streaming mode (${streamingWorkerCount} workers).`;
+        status.style.color = '#4ade80';
+        modeBanner.textContent = `Streaming parallel \u2014 ${streamingWorkerCount} workers (Web Workers, no SharedArrayBuffer)`;
+        modeBanner.style.background = '#1a3a1a';
+        modeBanner.style.color = '#4ade80';
+        document.getElementById('info-mode').textContent =
+          `Streaming (${streamingWorkerCount} workers, Web Workers)`;
       } else if (parallelAvailable && threadCount > 1) {
         activeThreadCount = threadCount;
         blake3Title.textContent = `WASM BLAKE3 (${threadCount} threads)`;
@@ -424,10 +488,18 @@
         return;
       }
 
-      // Guard: file too large for 64MB WASM memory
-      if (file.size > 60 * 1024 * 1024) {
+      // --- Determine if streaming will be used ---
+      let useStreaming = false;
+      if (isStreamingMode && streamingAvailable) {
+        useStreaming = true;
+      } else if (isAutoMode && file.size >= AUTO_THRESHOLD && streamingAvailable) {
+        useStreaming = true;
+      }
+
+      // Guard: file too large for 64MB WASM memory (only for non-streaming modes)
+      if (!useStreaming && file.size > 60 * 1024 * 1024) {
         const status = document.getElementById('status');
-        status.textContent = `File too large for WASM (${formatSize(file.size)} > 60 MB limit). Try a smaller file.`;
+        status.textContent = `File too large for WASM (${formatSize(file.size)} > 60 MB limit). Try a smaller file or use streaming mode.`;
         status.style.color = '#f87171';
         return;
       }
@@ -435,6 +507,8 @@
       const results = document.getElementById('results');
       const status = document.getElementById('status');
       const fileInfo = document.getElementById('file-info');
+      const progressBar = document.getElementById('progress-bar');
+      const progressFill = document.getElementById('progress-fill');
       results.style.display = 'grid';
       fileInfo.style.display = 'block';
       fileInfo.textContent = `${file.name} \u2014 ${formatSize(file.size)}`;
@@ -443,36 +517,60 @@
       const now = new Date();
       document.getElementById('info-timestamp').textContent = now.toLocaleString();
 
-      const arrayBuffer = await file.arrayBuffer();
-      const data = new Uint8Array(arrayBuffer);
+      // --- Choose mode and execute BLAKE3 ---
+      let blake3HashResult, blake3Time, modeStr, data;
 
-      // --- Choose hash function based on mode ---
-      let hashFn, modeStr;
-      if (isAutoMode) {
-        if (file.size >= AUTO_THRESHOLD && parallelAvailable) {
-          hashFn = blake3HashParallel;
-          activeThreadCount = autoParallelThreads;
-          modeStr = `Auto \u2192 parallel ${autoParallelThreads} threads (file \u2265 10 MB)`;
-          document.getElementById('blake3-title').textContent = `WASM BLAKE3 (${autoParallelThreads} threads)`;
-        } else {
-          hashFn = blake3HashSingle;
-          activeThreadCount = 1;
-          modeStr = file.size < AUTO_THRESHOLD
-            ? 'Auto \u2192 single-threaded (file < 10 MB)'
-            : 'Auto \u2192 single-threaded (parallel unavailable)';
-          document.getElementById('blake3-title').textContent = 'WASM BLAKE3 (single-threaded)';
-        }
+      if (useStreaming) {
+        // Streaming path: no pre-read of full file, progress bar, use returned timeMs
+        modeStr = isStreamingMode
+          ? `Streaming parallel \u2014 ${streamingWorkerCount} workers (Web Workers, no SharedArrayBuffer)`
+          : `Auto \u2192 streaming ${streamingWorkerCount} workers (file \u2265 10 MB)`;
+        document.getElementById('blake3-title').textContent = `WASM BLAKE3 (streaming ${streamingWorkerCount} workers)`;
+
+        progressFill.style.width = '0%';
+        progressBar.style.display = 'block';
+        const result = await streamingHasher.hashFileStreaming(file, ({ bytesRead, totalBytes }) => {
+          progressFill.style.width = Math.round((bytesRead / totalBytes) * 100) + '%';
+        });
+        blake3Time = result.timeMs;
+        blake3HashResult = result.hash;
+        progressBar.style.display = 'none';
+
+        // Read arrayBuffer for SHA-256 (streaming already finished with file)
+        const arrayBuffer = await file.arrayBuffer();
+        data = new Uint8Array(arrayBuffer);
       } else {
-        hashFn = activeThreadCount > 1 && parallelAvailable ? blake3HashParallel : blake3HashSingle;
-        modeStr = activeThreadCount > 1
-          ? `Parallel (${activeThreadCount} threads)`
-          : 'Single-threaded (SIMD)';
+        // Standard path: read arrayBuffer, hash single/rayon, then SHA-256
+        const arrayBuffer = await file.arrayBuffer();
+        data = new Uint8Array(arrayBuffer);
+
+        let hashFn;
+        if (isAutoMode) {
+          if (file.size >= AUTO_THRESHOLD && parallelAvailable) {
+            hashFn = blake3HashParallel;
+            activeThreadCount = autoParallelThreads;
+            modeStr = `Auto \u2192 parallel ${autoParallelThreads} threads (file \u2265 10 MB)`;
+            document.getElementById('blake3-title').textContent = `WASM BLAKE3 (${autoParallelThreads} threads)`;
+          } else {
+            hashFn = blake3HashSingle;
+            activeThreadCount = 1;
+            modeStr = file.size < AUTO_THRESHOLD
+              ? 'Auto \u2192 single-threaded (file < 10 MB)'
+              : 'Auto \u2192 single-threaded (parallel unavailable)';
+            document.getElementById('blake3-title').textContent = 'WASM BLAKE3 (single-threaded)';
+          }
+        } else {
+          hashFn = activeThreadCount > 1 && parallelAvailable ? blake3HashParallel : blake3HashSingle;
+          modeStr = activeThreadCount > 1
+            ? `Parallel (${activeThreadCount} threads)`
+            : 'Single-threaded (SIMD)';
+        }
+
+        const blake3Start = performance.now();
+        blake3HashResult = hashFn(data);
+        blake3Time = performance.now() - blake3Start;
       }
 
-      // --- BLAKE3 ---
-      const blake3Start = performance.now();
-      const blake3HashResult = hashFn(data);
-      const blake3Time = performance.now() - blake3Start;
       const blake3Speed = (file.size / 1024 / 1024) / (blake3Time / 1000);
 
       document.getElementById('blake3-hash').textContent = toHex(blake3HashResult).slice(0, 16) + '...';
