@@ -7,7 +7,7 @@
   <style>
     body {
       font-family: system-ui, sans-serif;
-      max-width: 1000px;
+      max-width: 1100px;
       margin: 0 auto;
       padding: 10px 15px;
       background: #1a1a2e;
@@ -152,6 +152,7 @@
         <th>Status</th>
         <th>Size</th>
         <th>Workers</th>
+        <th>Leaf Size</th>
         <th>Expected (hash_single)</th>
         <th>Got (hashFile)</th>
         <th>Time</th>
@@ -168,6 +169,7 @@
         <th>Status</th>
         <th>Size</th>
         <th>Workers</th>
+        <th>Leaf Size</th>
         <th>Expected (hash_single)</th>
         <th>Got (streaming)</th>
         <th>Time</th>
@@ -258,50 +260,60 @@
 
     // Test config
     const TEST_SIZES = [0, 500, 1024, 1025, 2048, 3072, 4096, 10240, 102400, 1048576];
-    const hwc = navigator.hardwareConcurrency || 4;
-    const WORKER_CONFIGS = [...new Set([1, 4, hwc])].sort((a, b) => a - b);
+    const WORKER_CONFIGS = [1, 2, 3];
+    const LEAF_SIZES = [65536, 262144, 1048576];  // 64KB, 256KB, 1MB
 
     const tbody = document.getElementById('test-body');
     const streamTbody = document.getElementById('stream-test-body');
     const summary = document.getElementById('summary');
 
+    // Build hasher config combinations: (workerCount, leafSize)
+    const hasherConfigs = [];
+    for (const workers of WORKER_CONFIGS) {
+      for (const leafSize of LEAF_SIZES) {
+        hasherConfigs.push({ workers, leafSize });
+      }
+    }
+
     // Pre-populate hashFile test rows
     const testRows = [];
     for (const size of TEST_SIZES) {
-      for (const workers of WORKER_CONFIGS) {
+      for (const { workers, leafSize } of hasherConfigs) {
         const tr = document.createElement('tr');
         tr.className = 'running';
         tr.innerHTML = `
           <td>...</td>
           <td>${formatSize(size)}</td>
           <td>${workers}</td>
+          <td>${formatSize(leafSize)}</td>
           <td class="hash">-</td>
           <td class="hash">-</td>
           <td class="time">-</td>
           <td class="match">-</td>
         `;
         tbody.appendChild(tr);
-        testRows.push({ tr, size, workers });
+        testRows.push({ tr, size, workers, leafSize });
       }
     }
 
     // Pre-populate hashFileStreaming test rows
     const streamTestRows = [];
     for (const size of TEST_SIZES) {
-      for (const workers of WORKER_CONFIGS) {
+      for (const { workers, leafSize } of hasherConfigs) {
         const tr = document.createElement('tr');
         tr.className = 'running';
         tr.innerHTML = `
           <td>...</td>
           <td>${formatSize(size)}</td>
           <td>${workers}</td>
+          <td>${formatSize(leafSize)}</td>
           <td class="hash">-</td>
           <td class="hash">-</td>
           <td class="time">-</td>
           <td class="match">-</td>
         `;
         streamTbody.appendChild(tr);
-        streamTestRows.push({ tr, size, workers });
+        streamTestRows.push({ tr, size, workers, leafSize });
       }
     }
 
@@ -316,17 +328,19 @@
       const total = testRows.length + streamTestRows.length;
 
       // --- hashFile tests ---
-      const byWorkers = new Map();
+      // Group by (workers, leafSize) for shared hasher instances
+      const byConfig = new Map();
       for (let i = 0; i < testRows.length; i++) {
-        const { workers } = testRows[i];
-        if (!byWorkers.has(workers)) byWorkers.set(workers, []);
-        byWorkers.get(workers).push(i);
+        const { workers, leafSize } = testRows[i];
+        const key = `${workers}-${leafSize}`;
+        if (!byConfig.has(key)) byConfig.set(key, { workers, leafSize, indices: [] });
+        byConfig.get(key).indices.push(i);
       }
 
-      for (const [workerCount, indices] of byWorkers) {
-        summary.textContent = `hashFile: ${workerCount} worker(s)... (${passed + failed}/${total})`;
+      for (const [, { workers: workerCount, leafSize, indices }] of byConfig) {
+        summary.textContent = `hashFile: ${workerCount} worker(s), leaf=${formatSize(leafSize)}... (${passed + failed}/${total})`;
 
-        const hasher = new StreamingHasher(workerCount);
+        const hasher = new StreamingHasher({ workerCount, leafSize });
         try {
           await hasher.init();
         } catch (err) {
@@ -335,8 +349,8 @@
             tr.className = 'fail';
             const cells = tr.querySelectorAll('td');
             cells[0].textContent = 'FAIL';
-            cells[6].textContent = 'Init error: ' + err.message;
-            cells[6].className = 'match no';
+            cells[7].textContent = 'Init error: ' + err.message;
+            cells[7].className = 'match no';
             failed++;
           }
           continue;
@@ -350,58 +364,59 @@
             const data = makeData(size);
             const expectedHash = hash_single(data);
             const expectedHex = toHex(expectedHash);
-            cells[3].textContent = expectedHex.slice(0, 16) + '...';
-            cells[3].title = expectedHex;
+            cells[4].textContent = expectedHex.slice(0, 16) + '...';
+            cells[4].title = expectedHex;
 
             const blob = new Blob([data]);
             const { hash: streamingHash, timeMs } = await hasher.hashFile(blob);
             const gotHex = toHex(streamingHash);
-            cells[4].textContent = gotHex.slice(0, 16) + '...';
-            cells[4].title = gotHex;
-            cells[5].textContent = timeMs.toFixed(1) + ' ms';
+            cells[5].textContent = gotHex.slice(0, 16) + '...';
+            cells[5].title = gotHex;
+            cells[6].textContent = timeMs.toFixed(1) + ' ms';
 
             const match = expectedHex === gotHex;
             if (match) {
               tr.className = 'pass';
               cells[0].textContent = 'PASS';
-              cells[6].textContent = 'YES';
-              cells[6].className = 'match yes';
+              cells[7].textContent = 'YES';
+              cells[7].className = 'match yes';
               passed++;
             } else {
               tr.className = 'fail';
               cells[0].textContent = 'FAIL';
-              cells[6].textContent = 'NO';
-              cells[6].className = 'match no';
+              cells[7].textContent = 'NO';
+              cells[7].className = 'match no';
               failed++;
             }
           } catch (err) {
             tr.className = 'fail';
             const cells = tr.querySelectorAll('td');
             cells[0].textContent = 'FAIL';
-            cells[4].textContent = err.message;
-            cells[6].textContent = 'ERROR';
-            cells[6].className = 'match no';
+            cells[5].textContent = err.message;
+            cells[7].textContent = 'ERROR';
+            cells[7].className = 'match no';
             failed++;
           }
 
-          summary.textContent = `hashFile: ${workerCount} worker(s)... (${passed + failed}/${total})`;
+          summary.textContent = `hashFile: ${workerCount} worker(s), leaf=${formatSize(leafSize)}... (${passed + failed}/${total})`;
         }
 
         hasher.terminate();
       }
 
       // --- hashFileStreaming tests ---
-      const byWorkersStream = new Map();
+      const byConfigStream = new Map();
       for (let i = 0; i < streamTestRows.length; i++) {
-        const { workers } = streamTestRows[i];
-        if (!byWorkersStream.has(workers)) byWorkersStream.set(workers, []);
-        byWorkersStream.get(workers).push(i);
+        const { workers, leafSize } = streamTestRows[i];
+        const key = `${workers}-${leafSize}`;
+        if (!byConfigStream.has(key)) byConfigStream.set(key, { workers, leafSize, indices: [] });
+        byConfigStream.get(key).indices.push(i);
       }
 
-      for (const [workerCount, indices] of byWorkersStream) {
-        summary.textContent = `hashFileStreaming: ${workerCount} worker(s)... (${passed + failed}/${total})`;
+      for (const [, { workers: workerCount, leafSize, indices }] of byConfigStream) {
+        summary.textContent = `hashFileStreaming: ${workerCount} worker(s), leaf=${formatSize(leafSize)}... (${passed + failed}/${total})`;
 
-        const hasher = new StreamingHasher(workerCount);
+        const hasher = new StreamingHasher({ workerCount, leafSize });
         try {
           await hasher.init();
         } catch (err) {
@@ -410,8 +425,8 @@
             tr.className = 'fail';
             const cells = tr.querySelectorAll('td');
             cells[0].textContent = 'FAIL';
-            cells[6].textContent = 'Init error: ' + err.message;
-            cells[6].className = 'match no';
+            cells[7].textContent = 'Init error: ' + err.message;
+            cells[7].className = 'match no';
             failed++;
           }
           continue;
@@ -425,41 +440,41 @@
             const data = makeData(size);
             const expectedHash = hash_single(data);
             const expectedHex = toHex(expectedHash);
-            cells[3].textContent = expectedHex.slice(0, 16) + '...';
-            cells[3].title = expectedHex;
+            cells[4].textContent = expectedHex.slice(0, 16) + '...';
+            cells[4].title = expectedHex;
 
             const blob = new Blob([data]);
             const { hash: streamHash, timeMs } = await hasher.hashFileStreaming(blob);
             const gotHex = toHex(streamHash);
-            cells[4].textContent = gotHex.slice(0, 16) + '...';
-            cells[4].title = gotHex;
-            cells[5].textContent = timeMs.toFixed(1) + ' ms';
+            cells[5].textContent = gotHex.slice(0, 16) + '...';
+            cells[5].title = gotHex;
+            cells[6].textContent = timeMs.toFixed(1) + ' ms';
 
             const match = expectedHex === gotHex;
             if (match) {
               tr.className = 'pass';
               cells[0].textContent = 'PASS';
-              cells[6].textContent = 'YES';
-              cells[6].className = 'match yes';
+              cells[7].textContent = 'YES';
+              cells[7].className = 'match yes';
               passed++;
             } else {
               tr.className = 'fail';
               cells[0].textContent = 'FAIL';
-              cells[6].textContent = 'NO';
-              cells[6].className = 'match no';
+              cells[7].textContent = 'NO';
+              cells[7].className = 'match no';
               failed++;
             }
           } catch (err) {
             tr.className = 'fail';
             const cells = tr.querySelectorAll('td');
             cells[0].textContent = 'FAIL';
-            cells[4].textContent = err.message;
-            cells[6].textContent = 'ERROR';
-            cells[6].className = 'match no';
+            cells[5].textContent = err.message;
+            cells[7].textContent = 'ERROR';
+            cells[7].className = 'match no';
             failed++;
           }
 
-          summary.textContent = `hashFileStreaming: ${workerCount} worker(s)... (${passed + failed}/${total})`;
+          summary.textContent = `hashFileStreaming: ${workerCount} worker(s), leaf=${formatSize(leafSize)}... (${passed + failed}/${total})`;
         }
 
         hasher.terminate();
@@ -505,7 +520,7 @@
       document.getElementById('mr-match').className = 'value match-status';
       document.getElementById('mr-progress').style.width = '0%';
 
-      const hasher = new StreamingHasher();
+      const hasher = new StreamingHasher({ workerCount: 3, leafSize: 1048576 });
       await hasher.init();
 
       // hashFile

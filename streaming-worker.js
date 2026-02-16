@@ -21,11 +21,11 @@ self.onmessage = async (e) => {
       self.postMessage({ type: 'error', error: 'Worker not initialized', taskId: e.data.taskId });
       return;
     }
-    const { data, inputOffset, taskId } = e.data;
+    const { data, offset, size, taskId } = e.data;
     try {
       const view = new Uint8Array(data);
-      const cv = hash_subtree(view, BigInt(inputOffset));
-      self.postMessage({ type: 'result', cv, taskId });
+      const cv = hash_subtree(view, BigInt(offset));
+      self.postMessage({ type: 'result', cv, offset, size, taskId });
     } catch (err) {
       self.postMessage({ type: 'error', error: err.message, taskId });
     }
