@@ -13,8 +13,8 @@ function maxSubtreeLen(offset) {
 
 export class StreamingHasher {
   #numWorkers;
-  #leafSize;
-  #bufferDepth;
+  #chunkSize;
+  #bufferBudget;
   #workers = [];
   #pendingTasks = new Map();
   #nextTaskId = 0;
@@ -27,8 +27,13 @@ export class StreamingHasher {
       options = { workerCount: options };
     }
     this.#numWorkers = options.workerCount ?? 3;
-    this.#leafSize = options.leafSize ?? 1048576;
-    this.#bufferDepth = options.bufferDepth ?? 2;
+    this.#chunkSize = options.chunkSize ?? 1048576;
+    if (options.bufferDepth != null) {
+      // Backward compat: convert chunk count to byte budget
+      this.#bufferBudget = options.bufferDepth * (options.chunkSize ?? 1048576);
+    } else {
+      this.#bufferBudget = options.bufferBudget ?? 268435456;  // 256 MiB
+    }
   }
 
   async init() {
@@ -104,7 +109,7 @@ export class StreamingHasher {
     const id = this.#nextNodeId++;
     const maxSub = maxSubtreeLen(offset);
 
-    if (size <= this.#leafSize && size <= maxSub) {
+    if (size <= this.#chunkSize && size <= maxSub) {
       const node = { id, type: 'leaf', offset, size, parentId: null };
       this.#nodeMap.set(id, node);
       return node;
@@ -214,6 +219,7 @@ export class StreamingHasher {
     const leaves = this.#collectLeaves(root);
 
     // Phase 2: Streaming + dispatch with backpressure
+    const maxInFlight = Math.max(1, Math.floor(this.#bufferBudget / this.#chunkSize));
     const cvMap = new Map();
     const workerInFlight = new Array(this.#numWorkers).fill(0);
     let slotResolve = null;
@@ -271,7 +277,7 @@ export class StreamingHasher {
 
           if (leafFilled === leaf.size) {
             // Wait for backpressure before dispatching
-            while (Math.min(...workerInFlight) >= this.#bufferDepth) {
+            while (Math.min(...workerInFlight) >= maxInFlight) {
               await new Promise(r => { slotResolve = r; });
             }
 
@@ -283,13 +289,13 @@ export class StreamingHasher {
 
             workerInFlight[workerIdx]++;
             const leafId = leaf.id;
-            const leafSize = leaf.size;
+            const nodeSize = leaf.size;
             const bufferToSend = leafBuffer.buffer;
 
             this.#dispatchBuffer(workerIdx, bufferToSend, leaf.offset).then(cv => {
               workerInFlight[workerIdx]--;
               if (slotResolve) { slotResolve(); slotResolve = null; }
-              bytesHashed += leafSize;
+              bytesHashed += nodeSize;
               if (onProgress) onProgress({ bytesRead, totalBytes, bytesHashed });
               cvMap.set(leafId, cv);
               bubbleUp(leafId);

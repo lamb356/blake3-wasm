@@ -1,0 +1,286 @@
+<!DOCTYPE html>
+<html>
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>BLAKE3 Chunk Size Sweep</title>
+  <style>
+    body {
+      font-family: system-ui, sans-serif;
+      max-width: 1100px;
+      margin: 0 auto;
+      padding: 10px 15px;
+      background: #1a1a2e;
+      color: #eee;
+    }
+    h1 { text-align: center; margin: 8px 0; }
+    .subtitle { text-align: center; color: #888; margin-bottom: 10px; }
+
+    .file-area {
+      border: 2px dashed #444;
+      border-radius: 8px;
+      padding: 15px 20px;
+      text-align: center;
+      margin-bottom: 10px;
+      cursor: pointer;
+    }
+    .file-area:hover { border-color: #666; }
+    .file-area.dragover { border-color: #4a9eff; background: #1a2a3e; }
+    .file-area input { display: none; }
+    .file-area button {
+      background: #4a9eff;
+      color: white;
+      border: none;
+      padding: 8px 18px;
+      border-radius: 6px;
+      font-size: 14px;
+      cursor: pointer;
+      margin-top: 4px;
+    }
+
+    #run-btn {
+      display: block;
+      margin: 0 auto 12px;
+      background: #4a9eff;
+      color: white;
+      border: none;
+      padding: 10px 28px;
+      border-radius: 6px;
+      font-size: 15px;
+      cursor: pointer;
+    }
+    #run-btn:disabled { opacity: 0.5; cursor: not-allowed; }
+
+    #status {
+      text-align: center;
+      color: #888;
+      margin-bottom: 10px;
+      font-size: 14px;
+    }
+
+    table {
+      width: 100%;
+      border-collapse: collapse;
+      margin-bottom: 16px;
+      font-size: 13px;
+    }
+    th {
+      background: #252540;
+      padding: 8px 10px;
+      text-align: left;
+      border-bottom: 2px solid #333;
+      color: #aaa;
+      font-size: 12px;
+      text-transform: uppercase;
+    }
+    td {
+      padding: 6px 10px;
+      border-bottom: 1px solid #2a2a40;
+      font-family: monospace;
+    }
+    tr.pass td:first-child { color: #4ade80; }
+    tr.fail td:first-child { color: #f87171; }
+    tr.running td { color: #fbbf24; }
+    tr.best td { background: #1a3a1a; }
+    td.hash { font-size: 11px; word-break: break-all; }
+    td.time { color: #888; }
+    td.match { font-weight: bold; }
+    td.match.yes { color: #4ade80; }
+    td.match.no { color: #f87171; }
+    td.speed { color: #4a9eff; font-weight: bold; }
+
+    .system-info {
+      background: #252540;
+      border-radius: 8px;
+      padding: 8px 14px;
+      margin-top: 10px;
+      font-size: 11px;
+      color: #888;
+      line-height: 1.4;
+    }
+    .system-info summary {
+      color: #ccc;
+      font-size: 12px;
+      font-weight: bold;
+      cursor: pointer;
+    }
+    .system-info span.val { color: #bbb; }
+  </style>
+</head>
+<body>
+  <h1>BLAKE3 Chunk Size Sweep</h1>
+  <p class="subtitle">Compare streaming performance across chunk sizes</p>
+
+  <div class="file-area" id="file-area">
+    <p style="margin: 4px 0;">Drop a file here or click to choose</p>
+    <button type="button">Choose File</button>
+    <input type="file" id="file-input">
+  </div>
+
+  <button id="run-btn" disabled>Run Sweep</button>
+  <div id="status"></div>
+
+  <table>
+    <thead>
+      <tr>
+        <th>Chunk Size</th>
+        <th>Speed (MB/s)</th>
+        <th>Time (ms)</th>
+        <th>Hash</th>
+        <th>Match</th>
+      </tr>
+    </thead>
+    <tbody id="results-body"></tbody>
+  </table>
+
+  <details class="system-info">
+    <summary>System Info</summary>
+    <div>Browser: <span class="val" id="info-browser">-</span></div>
+    <div>CPU Cores: <span class="val" id="info-cores">-</span></div>
+  </details>
+
+  <script type="module">
+    import wasmInit from './blake3-wasm-streaming/pkg/blake3_wasm_streaming.js';
+    import { StreamingHasher } from './streaming-hasher.js';
+
+    function toHex(bytes) {
+      return Array.from(bytes).map(b => b.toString(16).padStart(2, '0')).join('');
+    }
+
+    function formatSize(bytes) {
+      if (bytes < 1024) return bytes + ' B';
+      if (bytes < 1024 * 1024) return (bytes / 1024).toFixed(0) + ' KiB';
+      return (bytes / 1024 / 1024).toFixed(0) + ' MiB';
+    }
+
+    // System info
+    document.getElementById('info-browser').textContent = navigator.userAgent;
+    document.getElementById('info-cores').textContent =
+      (navigator.hardwareConcurrency || 'unknown') + ' logical cores';
+
+    // 16 chunk sizes: 1 KiB through 32 MiB (powers of 2)
+    const CHUNK_SIZES = [];
+    for (let exp = 10; exp <= 25; exp++) {
+      CHUNK_SIZES.push(1 << exp);
+    }
+
+    const WORKER_COUNT = 6;
+    const BUFFER_BUDGET = 256 * 1024 * 1024;  // 256 MiB
+
+    let selectedFile = null;
+    const fileArea = document.getElementById('file-area');
+    const fileInput = document.getElementById('file-input');
+    const runBtn = document.getElementById('run-btn');
+    const statusEl = document.getElementById('status');
+    const tbody = document.getElementById('results-body');
+
+    fileArea.addEventListener('click', () => fileInput.click());
+    fileInput.addEventListener('change', (e) => {
+      if (e.target.files[0]) pickFile(e.target.files[0]);
+    });
+    fileArea.addEventListener('dragover', (e) => {
+      e.preventDefault();
+      fileArea.classList.add('dragover');
+    });
+    fileArea.addEventListener('dragleave', () => fileArea.classList.remove('dragover'));
+    fileArea.addEventListener('drop', (e) => {
+      e.preventDefault();
+      fileArea.classList.remove('dragover');
+      if (e.dataTransfer.files[0]) pickFile(e.dataTransfer.files[0]);
+    });
+
+    function pickFile(file) {
+      selectedFile = file;
+      statusEl.textContent = `Selected: ${file.name} (${formatSize(file.size)})`;
+      runBtn.disabled = false;
+    }
+
+    runBtn.addEventListener('click', () => {
+      if (selectedFile) runSweep(selectedFile);
+    });
+
+    async function runSweep(file) {
+      runBtn.disabled = true;
+      tbody.innerHTML = '';
+
+      // Pre-populate rows
+      const rows = [];
+      for (const chunkSize of CHUNK_SIZES) {
+        const tr = document.createElement('tr');
+        tr.className = 'running';
+        tr.innerHTML = `
+          <td>${formatSize(chunkSize)}</td>
+          <td class="speed">-</td>
+          <td class="time">-</td>
+          <td class="hash">-</td>
+          <td class="match">-</td>
+        `;
+        tbody.appendChild(tr);
+        rows.push(tr);
+      }
+
+      await wasmInit();
+
+      let firstHash = null;
+      let bestIdx = -1;
+      let bestSpeed = 0;
+      const results = [];
+
+      for (let i = 0; i < CHUNK_SIZES.length; i++) {
+        const chunkSize = CHUNK_SIZES[i];
+        const cells = rows[i].querySelectorAll('td');
+        statusEl.textContent = `Testing chunk size ${formatSize(chunkSize)}... (${i + 1}/${CHUNK_SIZES.length})`;
+
+        try {
+          const hasher = new StreamingHasher({
+            workerCount: WORKER_COUNT,
+            chunkSize,
+            bufferBudget: BUFFER_BUDGET
+          });
+          await hasher.init();
+
+          const { hash, timeMs } = await hasher.hashFileStreaming(file);
+          hasher.terminate();
+
+          const hex = toHex(hash);
+          const speedMBs = (file.size / 1024 / 1024) / (timeMs / 1000);
+
+          cells[1].textContent = speedMBs.toFixed(1);
+          cells[2].textContent = timeMs.toFixed(1);
+          cells[3].textContent = hex.slice(0, 16) + '...';
+          cells[3].title = hex;
+
+          if (firstHash === null) firstHash = hex;
+          const match = hex === firstHash;
+          cells[4].textContent = match ? 'YES' : 'NO';
+          cells[4].className = 'match ' + (match ? 'yes' : 'no');
+          rows[i].className = match ? 'pass' : 'fail';
+
+          if (speedMBs > bestSpeed) {
+            bestSpeed = speedMBs;
+            bestIdx = i;
+          }
+
+          results.push({ speedMBs, timeMs, hex, match });
+        } catch (err) {
+          cells[1].textContent = '-';
+          cells[2].textContent = '-';
+          cells[3].textContent = err.message;
+          cells[4].textContent = 'ERROR';
+          cells[4].className = 'match no';
+          rows[i].className = 'fail';
+          results.push(null);
+        }
+      }
+
+      // Highlight best row
+      if (bestIdx >= 0) {
+        rows[bestIdx].classList.add('best');
+      }
+
+      statusEl.textContent = `Sweep complete. Best: ${formatSize(CHUNK_SIZES[bestIdx])} at ${bestSpeed.toFixed(1)} MB/s`;
+      runBtn.disabled = false;
+    }
+  </script>
+</body>
+</html>
