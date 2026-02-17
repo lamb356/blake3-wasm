@@ -219,7 +219,7 @@ export class StreamingHasher {
     const leaves = this.#collectLeaves(root);
 
     // Phase 2: Streaming + dispatch with backpressure
-    const maxInFlight = Math.max(1, Math.floor(this.#bufferBudget / this.#chunkSize));
+    const maxInFlight = Math.min(256, Math.max(1, Math.floor(this.#bufferBudget / this.#chunkSize)));
     const cvMap = new Map();
     const workerInFlight = new Array(this.#numWorkers).fill(0);
     let slotResolve = null;
