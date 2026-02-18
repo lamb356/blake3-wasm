@@ -144,6 +144,14 @@
       <option value="6" selected>6</option>
       <option value="8">8</option>
     </select>
+    &nbsp;&nbsp;
+    <label for="chunk-size" style="color: #aaa; font-size: 14px;">Chunk size: </label>
+    <select id="chunk-size" style="background: #252540; color: #eee; border: 1px solid #444; border-radius: 4px; padding: 4px 8px; font-size: 14px;">
+      <option value="16384">16 KiB</option>
+      <option value="65536">64 KiB</option>
+      <option value="262144">256 KiB</option>
+      <option value="1048576" selected>1 MiB</option>
+    </select>
   </div>
 
   <button id="run-btn" disabled>Run Benchmark</button>
@@ -226,8 +234,6 @@
       return (bytes / 1024 / 1024 / 1024).toFixed(2) + ' GiB';
     }
 
-    const ST_CHUNK = 1 * 1024 * 1024; // 1 MiB leaves — matches SAB hasher chunk size
-
     function maxSubtreeLen(offset) {
       if (offset === 0) return Infinity;
       const chunkIndex = offset / 1024;
@@ -235,15 +241,15 @@
       return (1 << trailingZeros) * 1024;
     }
 
-    function hashTree(data, offset, size, isRoot) {
+    function hashTree(data, offset, size, isRoot, chunkSize) {
       const maxSub = maxSubtreeLen(offset);
-      if (size <= ST_CHUNK && size <= maxSub) {
+      if (size <= chunkSize && size <= maxSub) {
         if (isRoot) return hash_single(data.subarray(offset, offset + size));
         return hash_subtree(data.subarray(offset, offset + size), BigInt(offset));
       }
       const leftLen = Number(left_subtree_len(BigInt(size)));
-      const leftCv = hashTree(data, offset, leftLen, false);
-      const rightCv = hashTree(data, offset + leftLen, size - leftLen, false);
+      const leftCv = hashTree(data, offset, leftLen, false, chunkSize);
+      const rightCv = hashTree(data, offset + leftLen, size - leftLen, false, chunkSize);
       return isRoot ? root_hash(leftCv, rightCv) : parent_cv(leftCv, rightCv);
     }
 
@@ -382,6 +388,7 @@
       document.getElementById('worker-stats').style.display = 'none';
 
       const workerCount = parseInt(document.getElementById('worker-count').value, 10);
+      const chunkSize = parseInt(document.getElementById('chunk-size').value, 10);
       const sizeMB = file.size / 1024 / 1024;
       const ITERATIONS = 3;
 
@@ -397,7 +404,7 @@
       if (sabAvailable) {
         statusEl.textContent = 'Running SAB Hasher...';
         try {
-          const hasher = new SABHasher({ workerCount, chunkSize: 1048576 });
+          const hasher = new SABHasher({ workerCount, chunkSize });
           await hasher.init();
 
           const runs = [];
@@ -433,7 +440,7 @@
       // --- Streaming Hasher ---
       statusEl.textContent = 'Running Streaming Hasher...';
       try {
-        const hasher = new StreamingHasher({ workerCount, chunkSize: 1048576 });
+        const hasher = new StreamingHasher({ workerCount, chunkSize });
         await hasher.init();
 
         const times = [];
@@ -466,7 +473,7 @@
         for (let i = 0; i < ITERATIONS; i++) {
           statusEl.textContent = `Single-threaded: iteration ${i + 1}/${ITERATIONS}`;
           const t0 = performance.now();
-          lastHash = hashTree(data, 0, data.byteLength, true);
+          lastHash = hashTree(data, 0, data.byteLength, true, chunkSize);
           times.push(performance.now() - t0);
         }
 
@@ -502,7 +509,7 @@
       if (bestRow) document.getElementById(bestRow).classList.add('best');
 
       const allMatch = hashes.length > 1 && hashes.every(h => h === refHash);
-      statusEl.textContent = `Benchmark complete (${workerCount} workers). File: ${file.name} (${formatSize(file.size)}). ${allMatch ? 'All hashes match.' : 'Hash mismatch!'} Fastest: ${bestSpeed.toFixed(1)} MB/s`;
+      statusEl.textContent = `Benchmark complete (${workerCount} workers, ${chunkSize >= 1048576 ? (chunkSize / 1048576) + ' MiB' : (chunkSize / 1024) + ' KiB'} chunks). File: ${file.name} (${formatSize(file.size)}). ${allMatch ? 'All hashes match.' : 'Hash mismatch!'} Fastest: ${bestSpeed.toFixed(1)} MB/s`;
       runBtn.disabled = false;
     }
   </script>
