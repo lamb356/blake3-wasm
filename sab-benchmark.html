@@ -151,6 +151,8 @@
       <option value="65536">64 KiB</option>
       <option value="262144">256 KiB</option>
       <option value="1048576" selected>1 MiB</option>
+      <option value="2097152">2 MiB</option>
+      <option value="4194304">4 MiB</option>
     </select>
   </div>
 
@@ -184,6 +186,13 @@
       </tr>
       <tr id="row-single" class="running">
         <td>Single-threaded</td>
+        <td class="hash">-</td>
+        <td class="time">-</td>
+        <td class="speed">-</td>
+        <td class="match">-</td>
+      </tr>
+      <tr id="row-sha256" class="running">
+        <td>SHA-256 (WebCrypto)</td>
         <td class="hash">-</td>
         <td class="time">-</td>
         <td class="speed">-</td>
@@ -385,6 +394,7 @@
       resetRow('row-sab');
       resetRow('row-streaming');
       resetRow('row-single');
+      resetRow('row-sha256');
       document.getElementById('worker-stats').style.display = 'none';
 
       const workerCount = parseInt(document.getElementById('worker-count').value, 10);
@@ -489,6 +499,31 @@
         cells[4].className = 'match no';
       }
 
+      // --- SHA-256 (WebCrypto) ---
+      statusEl.textContent = 'Running SHA-256 (WebCrypto)...';
+      try {
+        const times = [];
+        let lastHash;
+        for (let i = 0; i < ITERATIONS; i++) {
+          statusEl.textContent = `SHA-256: iteration ${i + 1}/${ITERATIONS}`;
+          const t0 = performance.now();
+          const hashBuf = await crypto.subtle.digest('SHA-256', data.buffer);
+          times.push(performance.now() - t0);
+          lastHash = new Uint8Array(hashBuf);
+        }
+
+        const med = median(times);
+        const hex = toHex(lastHash);
+        results.sha256 = fillRow('row-sha256', hex, med, sizeMB);
+      } catch (err) {
+        const row = document.getElementById('row-sha256');
+        row.className = '';
+        const cells = row.querySelectorAll('td');
+        cells[1].textContent = err.message;
+        cells[4].textContent = 'ERROR';
+        cells[4].className = 'match no';
+      }
+
       // Check hash match
       const hashes = [];
       if (results.sab) hashes.push(results.sab.hex);
@@ -500,6 +535,12 @@
       if (results.streaming) markMatch('row-streaming', results.streaming.hex === refHash);
       if (results.single) markMatch('row-single', results.single.hex === refHash);
 
+      if (results.sha256) {
+        const cells = document.getElementById('row-sha256').querySelectorAll('td');
+        cells[4].textContent = 'N/A';
+        cells[4].className = 'match';
+      }
+
       // Highlight fastest
       let bestRow = null;
       let bestSpeed = 0;
@@ -509,7 +550,7 @@
       if (bestRow) document.getElementById(bestRow).classList.add('best');
 
       const allMatch = hashes.length > 1 && hashes.every(h => h === refHash);
-      statusEl.textContent = `Benchmark complete (${workerCount} workers, ${chunkSize >= 1048576 ? (chunkSize / 1048576) + ' MiB' : (chunkSize / 1024) + ' KiB'} chunks). File: ${file.name} (${formatSize(file.size)}). ${allMatch ? 'All hashes match.' : 'Hash mismatch!'} Fastest: ${bestSpeed.toFixed(1)} MB/s`;
+      statusEl.textContent = `Benchmark complete (${workerCount} workers, ${chunkSize >= 1048576 ? (chunkSize / 1048576) + ' MiB' : (chunkSize / 1024) + ' KiB'} chunks). File: ${file.name} (${formatSize(file.size)}). ${allMatch ? 'All hashes match.' : 'Hash mismatch!'} Fastest BLAKE3: ${bestSpeed.toFixed(1)} MB/s${results.sha256 ? '. SHA-256: ' + results.sha256.speed.toFixed(1) + ' MB/s' : ''}`;
       runBtn.disabled = false;
     }
   </script>
