@@ -210,7 +210,8 @@
     function formatSize(bytes) {
       if (bytes < 1024) return bytes + ' B';
       if (bytes < 1024 * 1024) return (bytes / 1024).toFixed(0) + ' KiB';
-      return (bytes / 1024 / 1024).toFixed(1) + ' MiB';
+      if (bytes < 1024 * 1024 * 1024) return (bytes / 1024 / 1024).toFixed(1) + ' MiB';
+      return (bytes / 1024 / 1024 / 1024).toFixed(2) + ' GiB';
     }
 
     function median(arr) {
@@ -467,7 +468,7 @@
       if (bestRow) document.getElementById(bestRow).classList.add('best');
 
       const allMatch = hashes.length > 1 && hashes.every(h => h === refHash);
-      statusEl.textContent = `Benchmark complete. ${allMatch ? 'All hashes match.' : 'Hash mismatch!'} Fastest: ${bestSpeed.toFixed(1)} MB/s`;
+      statusEl.textContent = `Benchmark complete. File: ${file.name} (${formatSize(file.size)}). ${allMatch ? 'All hashes match.' : 'Hash mismatch!'} Fastest: ${bestSpeed.toFixed(1)} MB/s`;
       runBtn.disabled = false;
     }
   </script>

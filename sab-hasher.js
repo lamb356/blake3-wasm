@@ -159,9 +159,14 @@ export class SABHasher {
       return { hash, timeMs: performance.now() - t0, workerStats: [] };
     }
 
-    // Create SAB and copy data once
-    const sab = new SharedArrayBuffer(uint8Array.byteLength);
-    new Uint8Array(sab).set(uint8Array);
+    // Reuse existing SAB or create + copy
+    let sab;
+    if (uint8Array.buffer instanceof SharedArrayBuffer) {
+      sab = uint8Array.buffer;
+    } else {
+      sab = new SharedArrayBuffer(uint8Array.byteLength);
+      new Uint8Array(sab).set(uint8Array);
+    }
 
     // Send SAB reference to all workers
     for (const w of this.#workers) {
