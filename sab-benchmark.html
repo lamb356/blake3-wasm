@@ -98,6 +98,12 @@
     td.match.yes { color: #4ade80; }
     td.match.no { color: #f87171; }
 
+    #worker-stats { display: none; margin-bottom: 16px; }
+    #worker-stats h2 { margin: 16px 0 8px; font-size: 16px; border-bottom: 1px solid #333; padding-bottom: 4px; }
+    tr.fastest-worker td { background: #1a3a1a; }
+    tr.slowest-worker td { background: #3a1a1a; }
+    #worker-ratio { text-align: center; color: #888; font-size: 13px; margin-top: 6px; }
+
     .system-info {
       background: #252540;
       border-radius: 8px;
@@ -165,6 +171,23 @@
       </tr>
     </tbody>
   </table>
+
+  <div id="worker-stats">
+    <h2>Per-Worker Breakdown (SAB Hasher)</h2>
+    <table>
+      <thead>
+        <tr>
+          <th>Worker</th>
+          <th>Tasks</th>
+          <th>Data (MB)</th>
+          <th>Time (ms)</th>
+          <th>Speed (MB/s)</th>
+        </tr>
+      </thead>
+      <tbody id="worker-stats-body"></tbody>
+    </table>
+    <div id="worker-ratio"></div>
+  </div>
 
   <details class="system-info">
     <summary>System Info</summary>
@@ -278,11 +301,51 @@
       cells[4].className = 'match ' + (match ? 'yes' : 'no');
     }
 
+    function renderWorkerStats(stats) {
+      if (!stats || stats.length === 0) return;
+      const section = document.getElementById('worker-stats');
+      const tbody = document.getElementById('worker-stats-body');
+      const ratioEl = document.getElementById('worker-ratio');
+      section.style.display = 'block';
+      tbody.innerHTML = '';
+
+      let maxSpeed = 0, minSpeed = Infinity, maxBytes = 0, minBytes = Infinity;
+      for (const ws of stats) {
+        if (ws.tasks > 0) {
+          if (ws.speedMBs > maxSpeed) maxSpeed = ws.speedMBs;
+          if (ws.speedMBs < minSpeed) minSpeed = ws.speedMBs;
+          if (ws.bytes > maxBytes) maxBytes = ws.bytes;
+          if (ws.bytes < minBytes) minBytes = ws.bytes;
+        }
+      }
+
+      for (const ws of stats) {
+        const tr = document.createElement('tr');
+        if (ws.tasks > 0 && ws.speedMBs === maxSpeed) tr.className = 'fastest-worker';
+        if (ws.tasks > 0 && ws.speedMBs === minSpeed && minSpeed !== maxSpeed) tr.className = 'slowest-worker';
+        tr.innerHTML = `
+          <td>${ws.id}</td>
+          <td>${ws.tasks}</td>
+          <td>${(ws.bytes / 1048576).toFixed(1)}</td>
+          <td>${ws.timeMs.toFixed(1)}</td>
+          <td>${ws.speedMBs.toFixed(1)}</td>
+        `;
+        tbody.appendChild(tr);
+      }
+
+      if (minBytes > 0 && minBytes !== maxBytes) {
+        ratioEl.textContent = `Fastest worker processed ${(maxBytes / minBytes).toFixed(1)}x more data than slowest`;
+      } else {
+        ratioEl.textContent = '';
+      }
+    }
+
     async function runBenchmark(file) {
       runBtn.disabled = true;
       resetRow('row-sab');
       resetRow('row-streaming');
       resetRow('row-single');
+      document.getElementById('worker-stats').style.display = 'none';
 
       const sizeMB = file.size / 1024 / 1024;
       const ITERATIONS = 3;
@@ -302,19 +365,19 @@
           const hasher = new SABHasher({ workerCount: 6, chunkSize: 1048576 });
           await hasher.init();
 
-          const times = [];
-          let lastHash;
+          const runs = [];
           for (let i = 0; i < ITERATIONS; i++) {
             statusEl.textContent = `SAB Hasher: iteration ${i + 1}/${ITERATIONS}`;
-            const { hash, timeMs } = await hasher.hash(data);
-            times.push(timeMs);
-            lastHash = hash;
+            const { hash, timeMs, workerStats } = await hasher.hash(data);
+            runs.push({ hash, timeMs, workerStats });
           }
 
           hasher.terminate();
-          const med = median(times);
-          const hex = toHex(lastHash);
-          results.sab = fillRow('row-sab', hex, med, sizeMB);
+          const sorted = runs.map((r, i) => ({ i, t: r.timeMs })).sort((a, b) => a.t - b.t);
+          const medianRun = runs[sorted[Math.floor(sorted.length / 2)].i];
+          const hex = toHex(medianRun.hash);
+          results.sab = fillRow('row-sab', hex, medianRun.timeMs, sizeMB);
+          renderWorkerStats(medianRun.workerStats);
         } catch (err) {
           const row = document.getElementById('row-sab');
           row.className = '';

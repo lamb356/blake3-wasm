@@ -156,7 +156,7 @@ export class SABHasher {
     // Small input shortcut: hash on main thread
     if (uint8Array.byteLength < 65536) {
       const hash = hash_single(uint8Array);
-      return { hash, timeMs: performance.now() - t0 };
+      return { hash, timeMs: performance.now() - t0, workerStats: [] };
     }
 
     // Create SAB and copy data once
@@ -176,11 +176,16 @@ export class SABHasher {
     // Single leaf: hash on main thread
     if (root.type === 'leaf') {
       const hash = hash_single(uint8Array);
-      return { hash, timeMs: performance.now() - t0 };
+      return { hash, timeMs: performance.now() - t0, workerStats: [] };
     }
 
     // Collect leaves
     const leaves = this.#collectLeaves(root);
+
+    // Per-worker stats
+    const workerStats = Array.from({ length: this.#numWorkers }, (_, i) => ({
+      id: i, tasks: 0, bytes: 0, timeMs: 0
+    }));
 
     // DAG bubble-up merge
     const cvMap = new Map();
@@ -216,8 +221,14 @@ export class SABHasher {
       }
       workerInFlight[workerIdx]++;
       const leafId = leaf.id;
+      const leafSize = leaf.size;
+      const dispatchTime = performance.now();
 
       this.#dispatchTask(workerIdx, leaf.offset, leaf.size).then(cv => {
+        const elapsed = performance.now() - dispatchTime;
+        workerStats[workerIdx].tasks++;
+        workerStats[workerIdx].bytes += leafSize;
+        workerStats[workerIdx].timeMs += elapsed;
         workerInFlight[workerIdx]--;
         cvMap.set(leafId, cv);
         bubbleUp(leafId);
@@ -225,7 +236,10 @@ export class SABHasher {
     }
 
     const finalHash = await rootPromise;
-    return { hash: finalHash, timeMs: performance.now() - t0 };
+    for (const ws of workerStats) {
+      ws.speedMBs = ws.timeMs > 0 ? (ws.bytes / 1048576) / (ws.timeMs / 1000) : 0;
+    }
+    return { hash: finalHash, timeMs: performance.now() - t0, workerStats };
   }
 
   terminate() {
