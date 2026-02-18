@@ -214,7 +214,7 @@
       return (bytes / 1024 / 1024 / 1024).toFixed(2) + ' GiB';
     }
 
-    const ST_CHUNK = 8 * 1024 * 1024; // 8 MiB leaves — fits safely in 64 MiB WASM heap
+    const ST_CHUNK = 1 * 1024 * 1024; // 1 MiB leaves — matches SAB hasher chunk size
 
     function maxSubtreeLen(offset) {
       if (offset === 0) return Infinity;
