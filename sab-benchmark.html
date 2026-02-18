@@ -199,7 +199,7 @@
 
   <script src="coi-serviceworker.min.js"></script>
   <script type="module">
-    import wasmInit, { hash_single } from './blake3-wasm-streaming/pkg/blake3_wasm_streaming.js';
+    import wasmInit, { hash_single, hash_subtree, left_subtree_len, parent_cv, root_hash } from './blake3-wasm-streaming/pkg/blake3_wasm_streaming.js';
     import { SABHasher } from './sab-hasher.js';
     import { StreamingHasher } from './streaming-hasher.js';
 
@@ -212,6 +212,27 @@
       if (bytes < 1024 * 1024) return (bytes / 1024).toFixed(0) + ' KiB';
       if (bytes < 1024 * 1024 * 1024) return (bytes / 1024 / 1024).toFixed(1) + ' MiB';
       return (bytes / 1024 / 1024 / 1024).toFixed(2) + ' GiB';
+    }
+
+    const ST_CHUNK = 8 * 1024 * 1024; // 8 MiB leaves — fits safely in 64 MiB WASM heap
+
+    function maxSubtreeLen(offset) {
+      if (offset === 0) return Infinity;
+      const chunkIndex = offset / 1024;
+      const trailingZeros = Math.log2(chunkIndex & -chunkIndex);
+      return (1 << trailingZeros) * 1024;
+    }
+
+    function hashTree(data, offset, size, isRoot) {
+      const maxSub = maxSubtreeLen(offset);
+      if (size <= ST_CHUNK && size <= maxSub) {
+        if (isRoot) return hash_single(data.subarray(offset, offset + size));
+        return hash_subtree(data.subarray(offset, offset + size), BigInt(offset));
+      }
+      const leftLen = Number(left_subtree_len(BigInt(size)));
+      const leftCv = hashTree(data, offset, leftLen, false);
+      const rightCv = hashTree(data, offset + leftLen, size - leftLen, false);
+      return isRoot ? root_hash(leftCv, rightCv) : parent_cv(leftCv, rightCv);
     }
 
     function median(arr) {
@@ -432,7 +453,7 @@
         for (let i = 0; i < ITERATIONS; i++) {
           statusEl.textContent = `Single-threaded: iteration ${i + 1}/${ITERATIONS}`;
           const t0 = performance.now();
-          lastHash = hash_single(data);
+          lastHash = hashTree(data, 0, data.byteLength, true);
           times.push(performance.now() - t0);
         }
 
