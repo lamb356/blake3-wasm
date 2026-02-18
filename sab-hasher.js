@@ -190,12 +190,14 @@ export class SABHasher {
 
     // Per-worker stats
     const workerStats = Array.from({ length: this.#numWorkers }, (_, i) => ({
-      id: i, tasks: 0, bytes: 0, timeMs: 0
+      id: i, tasks: 0, bytes: 0, timeMs: 0, underruns: 0
     }));
 
     // DAG bubble-up merge
     const cvMap = new Map();
     const workerInFlight = new Array(this.#numWorkers).fill(0);
+    const workerHasHadWork = new Array(this.#numWorkers).fill(false);
+    const workerUnderruns = new Array(this.#numWorkers).fill(0);
 
     let resolveRoot, rejectRoot;
     const rootPromise = new Promise((r, rej) => { resolveRoot = r; rejectRoot = rej; });
@@ -248,6 +250,10 @@ export class SABHasher {
       for (let w = 1; w < this.#numWorkers; w++) {
         if (workerInFlight[w] < workerInFlight[workerIdx]) workerIdx = w;
       }
+      if (workerInFlight[workerIdx] === 0 && workerHasHadWork[workerIdx]) {
+        workerUnderruns[workerIdx]++;
+      }
+      workerHasHadWork[workerIdx] = true;
       workerInFlight[workerIdx]++;
 
       const leafId = leaf.id;
@@ -260,8 +266,9 @@ export class SABHasher {
     }
 
     const finalHash = await rootPromise;
-    for (const ws of workerStats) {
-      ws.speedMBs = ws.timeMs > 0 ? (ws.bytes / 1048576) / (ws.timeMs / 1000) : 0;
+    for (let i = 0; i < workerStats.length; i++) {
+      workerStats[i].underruns = workerUnderruns[i];
+      workerStats[i].speedMBs = workerStats[i].timeMs > 0 ? (workerStats[i].bytes / 1048576) / (workerStats[i].timeMs / 1000) : 0;
     }
     return { hash: finalHash, timeMs: performance.now() - t0, workerStats };
   }

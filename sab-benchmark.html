@@ -211,11 +211,13 @@
           <th>Data (MB)</th>
           <th>Time (ms)</th>
           <th>Speed (MB/s)</th>
+          <th>Underruns</th>
         </tr>
       </thead>
       <tbody id="worker-stats-body"></tbody>
     </table>
     <div id="worker-ratio"></div>
+    <div id="underrun-summary"></div>
   </div>
 
   <details class="system-info">
@@ -355,6 +357,7 @@
       const section = document.getElementById('worker-stats');
       const tbody = document.getElementById('worker-stats-body');
       const ratioEl = document.getElementById('worker-ratio');
+      const underrunEl = document.getElementById('underrun-summary');
       section.style.display = 'block';
       tbody.innerHTML = '';
 
@@ -378,6 +381,7 @@
           <td>${(ws.bytes / 1048576).toFixed(1)}</td>
           <td>${ws.timeMs.toFixed(1)}</td>
           <td>${ws.speedMBs.toFixed(1)}</td>
+          <td>${ws.underruns}</td>
         `;
         tbody.appendChild(tr);
       }
@@ -386,6 +390,15 @@
         ratioEl.textContent = `Fastest worker processed ${(maxBytes / minBytes).toFixed(1)}x more data than slowest`;
       } else {
         ratioEl.textContent = '';
+      }
+
+      const totalUnderruns = stats.reduce((sum, ws) => sum + (ws.underruns || 0), 0);
+      if (totalUnderruns > 0) {
+        underrunEl.style.color = '#fbbf24';
+        underrunEl.textContent = `Total underruns: ${totalUnderruns} (workers starved for work)`;
+      } else {
+        underrunEl.style.color = '#4ade80';
+        underrunEl.textContent = 'No underruns detected';
       }
     }
 
