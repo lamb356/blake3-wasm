@@ -134,6 +134,18 @@
     <input type="file" id="file-input">
   </div>
 
+  <div style="text-align: center; margin-bottom: 8px;">
+    <label for="worker-count" style="color: #aaa; font-size: 14px;">Workers: </label>
+    <select id="worker-count" style="background: #252540; color: #eee; border: 1px solid #444; border-radius: 4px; padding: 4px 8px; font-size: 14px;">
+      <option value="1">1</option>
+      <option value="2">2</option>
+      <option value="3">3</option>
+      <option value="4">4</option>
+      <option value="6" selected>6</option>
+      <option value="8">8</option>
+    </select>
+  </div>
+
   <button id="run-btn" disabled>Run Benchmark</button>
   <div id="status"></div>
 
@@ -369,6 +381,7 @@
       resetRow('row-single');
       document.getElementById('worker-stats').style.display = 'none';
 
+      const workerCount = parseInt(document.getElementById('worker-count').value, 10);
       const sizeMB = file.size / 1024 / 1024;
       const ITERATIONS = 3;
 
@@ -384,7 +397,7 @@
       if (sabAvailable) {
         statusEl.textContent = 'Running SAB Hasher...';
         try {
-          const hasher = new SABHasher({ workerCount: 6, chunkSize: 1048576 });
+          const hasher = new SABHasher({ workerCount, chunkSize: 1048576 });
           await hasher.init();
 
           const runs = [];
@@ -420,7 +433,7 @@
       // --- Streaming Hasher ---
       statusEl.textContent = 'Running Streaming Hasher...';
       try {
-        const hasher = new StreamingHasher({ workerCount: 6, chunkSize: 1048576 });
+        const hasher = new StreamingHasher({ workerCount, chunkSize: 1048576 });
         await hasher.init();
 
         const times = [];
@@ -489,7 +502,7 @@
       if (bestRow) document.getElementById(bestRow).classList.add('best');
 
       const allMatch = hashes.length > 1 && hashes.every(h => h === refHash);
-      statusEl.textContent = `Benchmark complete. File: ${file.name} (${formatSize(file.size)}). ${allMatch ? 'All hashes match.' : 'Hash mismatch!'} Fastest: ${bestSpeed.toFixed(1)} MB/s`;
+      statusEl.textContent = `Benchmark complete (${workerCount} workers). File: ${file.name} (${formatSize(file.size)}). ${allMatch ? 'All hashes match.' : 'Hash mismatch!'} Fastest: ${bestSpeed.toFixed(1)} MB/s`;
       runBtn.disabled = false;
     }
   </script>
