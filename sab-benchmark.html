@@ -1,0 +1,412 @@
+<!DOCTYPE html>
+<html>
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>BLAKE3 SAB vs Streaming Benchmark</title>
+  <style>
+    body {
+      font-family: system-ui, sans-serif;
+      max-width: 1100px;
+      margin: 0 auto;
+      padding: 10px 15px;
+      background: #1a1a2e;
+      color: #eee;
+    }
+    h1 { text-align: center; margin: 8px 0; }
+    .subtitle { text-align: center; color: #888; margin-bottom: 10px; }
+
+    .coi-banner {
+      text-align: center;
+      padding: 8px 14px;
+      border-radius: 8px;
+      font-size: 13px;
+      font-weight: bold;
+      margin-bottom: 10px;
+    }
+    .coi-banner.ok { background: #1a3a1a; color: #4ade80; }
+    .coi-banner.warn { background: #3a2a1a; color: #fbbf24; }
+
+    .file-area {
+      border: 2px dashed #444;
+      border-radius: 8px;
+      padding: 15px 20px;
+      text-align: center;
+      margin-bottom: 10px;
+      cursor: pointer;
+    }
+    .file-area:hover { border-color: #666; }
+    .file-area.dragover { border-color: #4a9eff; background: #1a2a3e; }
+    .file-area input { display: none; }
+    .file-area button {
+      background: #4a9eff;
+      color: white;
+      border: none;
+      padding: 8px 18px;
+      border-radius: 6px;
+      font-size: 14px;
+      cursor: pointer;
+      margin-top: 4px;
+    }
+
+    #run-btn {
+      display: block;
+      margin: 0 auto 12px;
+      background: #4a9eff;
+      color: white;
+      border: none;
+      padding: 10px 28px;
+      border-radius: 6px;
+      font-size: 15px;
+      cursor: pointer;
+    }
+    #run-btn:disabled { opacity: 0.5; cursor: not-allowed; }
+
+    #status {
+      text-align: center;
+      color: #888;
+      margin-bottom: 10px;
+      font-size: 14px;
+    }
+
+    table {
+      width: 100%;
+      border-collapse: collapse;
+      margin-bottom: 16px;
+      font-size: 13px;
+    }
+    th {
+      background: #252540;
+      padding: 8px 10px;
+      text-align: left;
+      border-bottom: 2px solid #333;
+      color: #aaa;
+      font-size: 12px;
+      text-transform: uppercase;
+    }
+    td {
+      padding: 6px 10px;
+      border-bottom: 1px solid #2a2a40;
+      font-family: monospace;
+    }
+    tr.running td { color: #fbbf24; }
+    tr.best td { background: #1a3a1a; }
+    td.hash { font-size: 11px; word-break: break-all; }
+    td.time { color: #888; }
+    td.speed { color: #4a9eff; font-weight: bold; }
+    td.match { font-weight: bold; }
+    td.match.yes { color: #4ade80; }
+    td.match.no { color: #f87171; }
+
+    .system-info {
+      background: #252540;
+      border-radius: 8px;
+      padding: 8px 14px;
+      margin-top: 10px;
+      font-size: 11px;
+      color: #888;
+      line-height: 1.4;
+    }
+    .system-info summary {
+      color: #ccc;
+      font-size: 12px;
+      font-weight: bold;
+      cursor: pointer;
+    }
+    .system-info span.val { color: #bbb; }
+  </style>
+</head>
+<body>
+  <h1>BLAKE3 SAB vs Streaming Benchmark</h1>
+  <p class="subtitle">Compare SharedArrayBuffer zero-copy vs copy-transfer hashing</p>
+
+  <div id="coi-banner" class="coi-banner"></div>
+
+  <div class="file-area" id="file-area">
+    <p style="margin: 4px 0;">Drop a file here or click to choose</p>
+    <button type="button">Choose File</button>
+    <input type="file" id="file-input">
+  </div>
+
+  <button id="run-btn" disabled>Run Benchmark</button>
+  <div id="status"></div>
+
+  <table>
+    <thead>
+      <tr>
+        <th>Method</th>
+        <th>Hash</th>
+        <th>Time (ms)</th>
+        <th>Speed (MB/s)</th>
+        <th>Match</th>
+      </tr>
+    </thead>
+    <tbody id="results-body">
+      <tr id="row-sab" class="running">
+        <td>SAB Hasher</td>
+        <td class="hash">-</td>
+        <td class="time">-</td>
+        <td class="speed">-</td>
+        <td class="match">-</td>
+      </tr>
+      <tr id="row-streaming" class="running">
+        <td>Streaming Hasher</td>
+        <td class="hash">-</td>
+        <td class="time">-</td>
+        <td class="speed">-</td>
+        <td class="match">-</td>
+      </tr>
+      <tr id="row-single" class="running">
+        <td>Single-threaded</td>
+        <td class="hash">-</td>
+        <td class="time">-</td>
+        <td class="speed">-</td>
+        <td class="match">-</td>
+      </tr>
+    </tbody>
+  </table>
+
+  <details class="system-info">
+    <summary>System Info</summary>
+    <div>CPU Cores: <span class="val" id="info-cores">-</span></div>
+    <div>Browser: <span class="val" id="info-browser">-</span></div>
+    <div>SAB Available: <span class="val" id="info-sab">-</span></div>
+    <div>Cross-Origin Isolated: <span class="val" id="info-coi">-</span></div>
+  </details>
+
+  <script src="coi-serviceworker.min.js"></script>
+  <script type="module">
+    import wasmInit, { hash_single } from './blake3-wasm-streaming/pkg/blake3_wasm_streaming.js';
+    import { SABHasher } from './sab-hasher.js';
+    import { StreamingHasher } from './streaming-hasher.js';
+
+    function toHex(bytes) {
+      return Array.from(bytes).map(b => b.toString(16).padStart(2, '0')).join('');
+    }
+
+    function formatSize(bytes) {
+      if (bytes < 1024) return bytes + ' B';
+      if (bytes < 1024 * 1024) return (bytes / 1024).toFixed(0) + ' KiB';
+      return (bytes / 1024 / 1024).toFixed(1) + ' MiB';
+    }
+
+    function median(arr) {
+      const sorted = [...arr].sort((a, b) => a - b);
+      const mid = Math.floor(sorted.length / 2);
+      return sorted.length % 2 ? sorted[mid] : (sorted[mid - 1] + sorted[mid]) / 2;
+    }
+
+    // System info
+    document.getElementById('info-cores').textContent =
+      (navigator.hardwareConcurrency || 'unknown') + ' logical cores';
+    document.getElementById('info-browser').textContent = navigator.userAgent;
+    document.getElementById('info-sab').textContent =
+      typeof SharedArrayBuffer !== 'undefined' ? 'Yes' : 'No';
+    document.getElementById('info-coi').textContent =
+      window.crossOriginIsolated ? 'Yes' : 'No';
+
+    // Cross-origin isolation banner
+    const coiBanner = document.getElementById('coi-banner');
+    const sabAvailable = typeof SharedArrayBuffer !== 'undefined' && window.crossOriginIsolated;
+
+    if (sabAvailable) {
+      coiBanner.className = 'coi-banner ok';
+      coiBanner.textContent = 'Cross-origin isolated \u2014 SharedArrayBuffer available';
+    } else {
+      coiBanner.className = 'coi-banner warn';
+      coiBanner.textContent = 'Page is not cross-origin isolated. SAB hasher unavailable.';
+    }
+
+    // File selection
+    let selectedFile = null;
+    const fileArea = document.getElementById('file-area');
+    const fileInput = document.getElementById('file-input');
+    const runBtn = document.getElementById('run-btn');
+    const statusEl = document.getElementById('status');
+
+    fileArea.addEventListener('click', () => fileInput.click());
+    fileInput.addEventListener('change', (e) => {
+      if (e.target.files[0]) pickFile(e.target.files[0]);
+    });
+    fileArea.addEventListener('dragover', (e) => {
+      e.preventDefault();
+      fileArea.classList.add('dragover');
+    });
+    fileArea.addEventListener('dragleave', () => fileArea.classList.remove('dragover'));
+    fileArea.addEventListener('drop', (e) => {
+      e.preventDefault();
+      fileArea.classList.remove('dragover');
+      if (e.dataTransfer.files[0]) pickFile(e.dataTransfer.files[0]);
+    });
+
+    function pickFile(file) {
+      selectedFile = file;
+      statusEl.textContent = `Selected: ${file.name} (${formatSize(file.size)})`;
+      runBtn.disabled = false;
+    }
+
+    runBtn.addEventListener('click', () => {
+      if (selectedFile) runBenchmark(selectedFile);
+    });
+
+    function resetRow(rowId) {
+      const cells = document.getElementById(rowId).querySelectorAll('td');
+      cells[1].textContent = '-';
+      cells[1].title = '';
+      cells[2].textContent = '-';
+      cells[3].textContent = '-';
+      cells[4].textContent = '-';
+      cells[4].className = 'match';
+      document.getElementById(rowId).className = 'running';
+    }
+
+    function fillRow(rowId, hex, timeMs, sizeMB) {
+      const row = document.getElementById(rowId);
+      const cells = row.querySelectorAll('td');
+      cells[1].textContent = hex.slice(0, 16) + '...';
+      cells[1].title = hex;
+      cells[2].textContent = timeMs.toFixed(1);
+      const speed = sizeMB / (timeMs / 1000);
+      cells[3].textContent = speed.toFixed(1);
+      row.className = '';
+      return { hex, timeMs, speed };
+    }
+
+    function markMatch(rowId, match) {
+      const cells = document.getElementById(rowId).querySelectorAll('td');
+      cells[4].textContent = match ? 'YES' : 'NO';
+      cells[4].className = 'match ' + (match ? 'yes' : 'no');
+    }
+
+    async function runBenchmark(file) {
+      runBtn.disabled = true;
+      resetRow('row-sab');
+      resetRow('row-streaming');
+      resetRow('row-single');
+
+      const sizeMB = file.size / 1024 / 1024;
+      const ITERATIONS = 3;
+
+      // Read file data for SAB and single-threaded methods
+      statusEl.textContent = 'Reading file...';
+      const data = new Uint8Array(await file.arrayBuffer());
+
+      await wasmInit();
+
+      const results = {};
+
+      // --- SAB Hasher ---
+      if (sabAvailable) {
+        statusEl.textContent = 'Running SAB Hasher...';
+        try {
+          const hasher = new SABHasher({ workerCount: 6, chunkSize: 1048576 });
+          await hasher.init();
+
+          const times = [];
+          let lastHash;
+          for (let i = 0; i < ITERATIONS; i++) {
+            statusEl.textContent = `SAB Hasher: iteration ${i + 1}/${ITERATIONS}`;
+            const { hash, timeMs } = await hasher.hash(data);
+            times.push(timeMs);
+            lastHash = hash;
+          }
+
+          hasher.terminate();
+          const med = median(times);
+          const hex = toHex(lastHash);
+          results.sab = fillRow('row-sab', hex, med, sizeMB);
+        } catch (err) {
+          const row = document.getElementById('row-sab');
+          row.className = '';
+          const cells = row.querySelectorAll('td');
+          cells[1].textContent = err.message;
+          cells[4].textContent = 'ERROR';
+          cells[4].className = 'match no';
+        }
+      } else {
+        const row = document.getElementById('row-sab');
+        row.className = '';
+        const cells = row.querySelectorAll('td');
+        cells[1].textContent = 'SAB unavailable';
+        cells[4].textContent = 'N/A';
+        cells[4].className = 'match';
+      }
+
+      // --- Streaming Hasher ---
+      statusEl.textContent = 'Running Streaming Hasher...';
+      try {
+        const hasher = new StreamingHasher({ workerCount: 6, chunkSize: 1048576 });
+        await hasher.init();
+
+        const times = [];
+        let lastHash;
+        for (let i = 0; i < ITERATIONS; i++) {
+          statusEl.textContent = `Streaming Hasher: iteration ${i + 1}/${ITERATIONS}`;
+          const { hash, timeMs } = await hasher.hashFileStreaming(file);
+          times.push(timeMs);
+          lastHash = hash;
+        }
+
+        hasher.terminate();
+        const med = median(times);
+        const hex = toHex(lastHash);
+        results.streaming = fillRow('row-streaming', hex, med, sizeMB);
+      } catch (err) {
+        const row = document.getElementById('row-streaming');
+        row.className = '';
+        const cells = row.querySelectorAll('td');
+        cells[1].textContent = err.message;
+        cells[4].textContent = 'ERROR';
+        cells[4].className = 'match no';
+      }
+
+      // --- Single-threaded ---
+      statusEl.textContent = 'Running Single-threaded...';
+      try {
+        const times = [];
+        let lastHash;
+        for (let i = 0; i < ITERATIONS; i++) {
+          statusEl.textContent = `Single-threaded: iteration ${i + 1}/${ITERATIONS}`;
+          const t0 = performance.now();
+          lastHash = hash_single(data);
+          times.push(performance.now() - t0);
+        }
+
+        const med = median(times);
+        const hex = toHex(lastHash);
+        results.single = fillRow('row-single', hex, med, sizeMB);
+      } catch (err) {
+        const row = document.getElementById('row-single');
+        row.className = '';
+        const cells = row.querySelectorAll('td');
+        cells[1].textContent = err.message;
+        cells[4].textContent = 'ERROR';
+        cells[4].className = 'match no';
+      }
+
+      // Check hash match
+      const hashes = [];
+      if (results.sab) hashes.push(results.sab.hex);
+      if (results.streaming) hashes.push(results.streaming.hex);
+      if (results.single) hashes.push(results.single.hex);
+
+      const refHash = hashes[0];
+      if (results.sab) markMatch('row-sab', results.sab.hex === refHash);
+      if (results.streaming) markMatch('row-streaming', results.streaming.hex === refHash);
+      if (results.single) markMatch('row-single', results.single.hex === refHash);
+
+      // Highlight fastest
+      let bestRow = null;
+      let bestSpeed = 0;
+      if (results.sab && results.sab.speed > bestSpeed) { bestSpeed = results.sab.speed; bestRow = 'row-sab'; }
+      if (results.streaming && results.streaming.speed > bestSpeed) { bestSpeed = results.streaming.speed; bestRow = 'row-streaming'; }
+      if (results.single && results.single.speed > bestSpeed) { bestSpeed = results.single.speed; bestRow = 'row-single'; }
+      if (bestRow) document.getElementById(bestRow).classList.add('best');
+
+      const allMatch = hashes.length > 1 && hashes.every(h => h === refHash);
+      statusEl.textContent = `Benchmark complete. ${allMatch ? 'All hashes match.' : 'Hash mismatch!'} Fastest: ${bestSpeed.toFixed(1)} MB/s`;
+      runBtn.disabled = false;
+    }
+  </script>
+</body>
+</html>
