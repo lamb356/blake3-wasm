@@ -3,6 +3,7 @@ import wasmInit, { hash_single, left_subtree_len, parent_cv, root_hash } from '.
 const CHUNK_SIZE = 1024;
 const WORKER_INIT_TIMEOUT = 10000;
 const HASH_TASK_TIMEOUT = 30000;
+const MAX_INFLIGHT_PER_WORKER = 2;
 
 function maxSubtreeLen(offset) {
   if (offset === 0) return Infinity;
@@ -218,26 +219,44 @@ export class SABHasher {
       }
     };
 
-    // Dispatch all leaves with least-loaded worker selection
+    // Dispatch leaves with least-loaded worker selection, capped at MAX_INFLIGHT_PER_WORKER
+    let resolveSlot = null;
+
+    const onTaskDone = (workerIdx, leafId, leafSize, dispatchTime, cv) => {
+      const elapsed = performance.now() - dispatchTime;
+      workerStats[workerIdx].tasks++;
+      workerStats[workerIdx].bytes += leafSize;
+      workerStats[workerIdx].timeMs += elapsed;
+      workerInFlight[workerIdx]--;
+      cvMap.set(leafId, cv);
+      bubbleUp(leafId);
+      // Unblock dispatch loop if it's waiting for a slot
+      if (resolveSlot && workerInFlight[workerIdx] < MAX_INFLIGHT_PER_WORKER) {
+        resolveSlot();
+        resolveSlot = null;
+      }
+    };
+
     for (const leaf of leaves) {
+      // Wait if all workers are at capacity
+      if (workerInFlight.every(n => n >= MAX_INFLIGHT_PER_WORKER)) {
+        await new Promise(r => { resolveSlot = r; });
+      }
+
+      // Pick least-loaded worker
       let workerIdx = 0;
       for (let w = 1; w < this.#numWorkers; w++) {
         if (workerInFlight[w] < workerInFlight[workerIdx]) workerIdx = w;
       }
       workerInFlight[workerIdx]++;
+
       const leafId = leaf.id;
       const leafSize = leaf.size;
       const dispatchTime = performance.now();
 
-      this.#dispatchTask(workerIdx, leaf.offset, leaf.size).then(cv => {
-        const elapsed = performance.now() - dispatchTime;
-        workerStats[workerIdx].tasks++;
-        workerStats[workerIdx].bytes += leafSize;
-        workerStats[workerIdx].timeMs += elapsed;
-        workerInFlight[workerIdx]--;
-        cvMap.set(leafId, cv);
-        bubbleUp(leafId);
-      }).catch(err => rejectRoot(err));
+      this.#dispatchTask(workerIdx, leaf.offset, leaf.size)
+        .then(cv => onTaskDone(workerIdx, leafId, leafSize, dispatchTime, cv))
+        .catch(err => rejectRoot(err));
     }
 
     const finalHash = await rootPromise;
