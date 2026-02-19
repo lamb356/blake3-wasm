@@ -226,6 +226,8 @@ export class SABStreamHasher {
     // Double-buffering: queue filled slots for dispatch instead of blocking
     const pendingDispatches = []; // { slotIdx, leaf, leafId, leafSize }
 
+    let onTaskDone;
+
     const tryDispatchPending = () => {
       while (pendingDispatches.length > 0) {
         if (workerInFlight.every(n => n >= MAX_INFLIGHT_PER_WORKER)) return;
@@ -248,7 +250,7 @@ export class SABStreamHasher {
       }
     };
 
-    const onTaskDone = (workerIdx, slotIdx, leafId, leafSize, dispatchTime, cv) => {
+    onTaskDone = (workerIdx, slotIdx, leafId, leafSize, dispatchTime, cv) => {
       const elapsed = performance.now() - dispatchTime;
       workerStats[workerIdx].tasks++;
       workerStats[workerIdx].bytes += leafSize;
@@ -300,7 +302,7 @@ export class SABStreamHasher {
 
             currentLeafIdx++;
             if (currentLeafIdx < leaves.length) {
-              // Find next free slot — only blocks if ALL slots busy
+              // Find next free slot -- only blocks if ALL slots busy
               let nextSlot = this.#findFreeSlot();
               while (nextSlot === -1) {
                 await new Promise(r => { resolveSlot = r; });
