@@ -223,6 +223,31 @@ export class SABStreamHasher {
     // Single resolver for dual backpressure (worker + slot)
     let resolveSlot = null;
 
+    // Double-buffering: queue filled slots for dispatch instead of blocking
+    const pendingDispatches = []; // { slotIdx, leaf, leafId, leafSize }
+
+    const tryDispatchPending = () => {
+      while (pendingDispatches.length > 0) {
+        if (workerInFlight.every(n => n >= MAX_INFLIGHT_PER_WORKER)) return;
+        const item = pendingDispatches.shift();
+
+        let workerIdx = 0;
+        for (let w = 1; w < this.#numWorkers; w++) {
+          if (workerInFlight[w] < workerInFlight[workerIdx]) workerIdx = w;
+        }
+        if (workerInFlight[workerIdx] === 0 && workerHasHadWork[workerIdx]) {
+          workerUnderruns[workerIdx]++;
+        }
+        workerHasHadWork[workerIdx] = true;
+        workerInFlight[workerIdx]++;
+
+        const dispatchTime = performance.now();
+        this.#dispatchTask(workerIdx, item.slotIdx * this.#chunkSize, item.leaf.offset, item.leaf.size)
+          .then(cv => onTaskDone(workerIdx, item.slotIdx, item.leafId, item.leafSize, dispatchTime, cv))
+          .catch(err => rejectRoot(err));
+      }
+    };
+
     const onTaskDone = (workerIdx, slotIdx, leafId, leafSize, dispatchTime, cv) => {
       const elapsed = performance.now() - dispatchTime;
       workerStats[workerIdx].tasks++;
@@ -232,6 +257,7 @@ export class SABStreamHasher {
       this.#slotInUse[slotIdx] = false;
       cvMap.set(leafId, cv);
       bubbleUp(leafId);
+      tryDispatchPending();
       if (resolveSlot) {
         resolveSlot();
         resolveSlot = null;
@@ -266,38 +292,19 @@ export class SABStreamHasher {
           chunkOffset += toCopy;
 
           if (leafFilled === leaf.size) {
-            // WORKER BACKPRESSURE: wait if all workers are at capacity
-            while (workerInFlight.every(n => n >= MAX_INFLIGHT_PER_WORKER)) {
-              await new Promise(r => { resolveSlot = r; });
-            }
-
-            // Pick least-loaded worker
-            let workerIdx = 0;
-            for (let w = 1; w < this.#numWorkers; w++) {
-              if (workerInFlight[w] < workerInFlight[workerIdx]) workerIdx = w;
-            }
-            if (workerInFlight[workerIdx] === 0 && workerHasHadWork[workerIdx]) {
-              workerUnderruns[workerIdx]++;
-            }
-            workerHasHadWork[workerIdx] = true;
-            workerInFlight[workerIdx]++;
-
-            const leafId = leaf.id;
-            const leafSize = leaf.size;
-            const dispatchTime = performance.now();
-            const capturedSlotIdx = currentSlotIdx;
-            const sabSlotOffset = capturedSlotIdx * this.#chunkSize;
-
-            this.#dispatchTask(workerIdx, sabSlotOffset, leaf.offset, leaf.size)
-              .then(cv => onTaskDone(workerIdx, capturedSlotIdx, leafId, leafSize, dispatchTime, cv))
-              .catch(err => rejectRoot(err));
+            // Queue for dispatch (non-blocking)
+            pendingDispatches.push({
+              slotIdx: currentSlotIdx, leaf, leafId: leaf.id, leafSize: leaf.size
+            });
+            tryDispatchPending();
 
             currentLeafIdx++;
             if (currentLeafIdx < leaves.length) {
-              // SLOT BACKPRESSURE: find a free slot, wait if all are busy
+              // Find next free slot — only blocks if ALL slots busy
               let nextSlot = this.#findFreeSlot();
               while (nextSlot === -1) {
                 await new Promise(r => { resolveSlot = r; });
+                tryDispatchPending();
                 nextSlot = this.#findFreeSlot();
               }
               currentSlotIdx = nextSlot;
@@ -310,6 +317,14 @@ export class SABStreamHasher {
       }
     } finally {
       reader.releaseLock();
+    }
+
+    // Drain any remaining pending dispatches
+    while (pendingDispatches.length > 0) {
+      tryDispatchPending();
+      if (pendingDispatches.length > 0) {
+        await new Promise(r => { resolveSlot = r; });
+      }
     }
 
     const finalHash = await rootPromise;
