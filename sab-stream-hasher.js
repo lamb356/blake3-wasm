@@ -220,19 +220,39 @@ export class SABStreamHasher {
       }
     };
 
-    // Single resolver for dual backpressure (worker + slot)
-    let resolveSlot = null;
+    // Notification system: multiple concurrent readers/dispatchers can wait
+    let waiters = [];
+    const notifyAll = () => { const w = waiters; waiters = []; for (const r of w) r(); };
+    const waitForSignal = () => new Promise(r => waiters.push(r));
 
-    // Double-buffering: queue filled slots for dispatch instead of blocking
-    const pendingDispatches = []; // { slotIdx, leaf, leafId, leafSize }
+    const onTaskDone = (workerIdx, slotIdx, leafId, leafSize, dispatchTime, cv) => {
+      const elapsed = performance.now() - dispatchTime;
+      workerStats[workerIdx].tasks++;
+      workerStats[workerIdx].bytes += leafSize;
+      workerStats[workerIdx].timeMs += elapsed;
+      workerInFlight[workerIdx]--;
+      this.#slotInUse[slotIdx] = false;
+      cvMap.set(leafId, cv);
+      bubbleUp(leafId);
+      notifyAll();
+    };
 
-    let onTaskDone;
+    // Read a leaf's bytes via File.slice() and dispatch to a worker
+    const readAndDispatch = async (leaf, slotIdx) => {
+      try {
+        // 1. Read exactly this leaf's bytes from disk (parallel I/O)
+        const blob = file.slice(leaf.offset, leaf.offset + leaf.size);
+        const data = new Uint8Array(await blob.arrayBuffer());
 
-    const tryDispatchPending = () => {
-      while (pendingDispatches.length > 0) {
-        if (workerInFlight.every(n => n >= MAX_INFLIGHT_PER_WORKER)) return;
-        const item = pendingDispatches.shift();
+        // 2. Single memcpy into SAB slot
+        new Uint8Array(this.#sab, slotIdx * this.#chunkSize, leaf.size).set(data);
 
+        // 3. Wait for worker availability
+        while (workerInFlight.every(n => n >= MAX_INFLIGHT_PER_WORKER)) {
+          await waitForSignal();
+        }
+
+        // 4. Select least-loaded worker + underrun tracking
         let workerIdx = 0;
         for (let w = 1; w < this.#numWorkers; w++) {
           if (workerInFlight[w] < workerInFlight[workerIdx]) workerIdx = w;
@@ -243,91 +263,30 @@ export class SABStreamHasher {
         workerHasHadWork[workerIdx] = true;
         workerInFlight[workerIdx]++;
 
+        // 5. Fire-and-forget dispatch
         const dispatchTime = performance.now();
-        this.#dispatchTask(workerIdx, item.slotIdx * this.#chunkSize, item.leaf.offset, item.leaf.size)
-          .then(cv => onTaskDone(workerIdx, item.slotIdx, item.leafId, item.leafSize, dispatchTime, cv))
+        this.#dispatchTask(workerIdx, slotIdx * this.#chunkSize, leaf.offset, leaf.size)
+          .then(cv => onTaskDone(workerIdx, slotIdx, leaf.id, leaf.size, dispatchTime, cv))
           .catch(err => rejectRoot(err));
+      } catch (err) {
+        rejectRoot(err);
       }
     };
 
-    onTaskDone = (workerIdx, slotIdx, leafId, leafSize, dispatchTime, cv) => {
-      const elapsed = performance.now() - dispatchTime;
-      workerStats[workerIdx].tasks++;
-      workerStats[workerIdx].bytes += leafSize;
-      workerStats[workerIdx].timeMs += elapsed;
-      workerInFlight[workerIdx]--;
-      this.#slotInUse[slotIdx] = false;
-      cvMap.set(leafId, cv);
-      bubbleUp(leafId);
-      tryDispatchPending();
-      if (resolveSlot) {
-        resolveSlot();
-        resolveSlot = null;
+    // Feed loop: claim slots and fire parallel File.slice() reads
+    const inFlightReads = [];
+
+    for (let i = 0; i < leaves.length; i++) {
+      let slotIdx = this.#findFreeSlot();
+      while (slotIdx === -1) {
+        await waitForSignal();
+        slotIdx = this.#findFreeSlot();
       }
-    };
-
-    // Stream + dispatch loop
-    let currentLeafIdx = 0;
-
-    // Acquire first free slot
-    let currentSlotIdx = this.#findFreeSlot();
-    this.#slotInUse[currentSlotIdx] = true;
-    let slotView = new Uint8Array(this.#sab, currentSlotIdx * this.#chunkSize, leaves[0].size);
-    let leafFilled = 0;
-
-    const reader = file.stream().getReader();
-    try {
-      while (true) {
-        const { done, value } = await reader.read();
-        if (done) break;
-
-        const chunk = value;
-        let chunkOffset = 0;
-
-        while (chunkOffset < chunk.length && currentLeafIdx < leaves.length) {
-          const leaf = leaves[currentLeafIdx];
-          const remaining = leaf.size - leafFilled;
-          const toCopy = Math.min(remaining, chunk.length - chunkOffset);
-
-          slotView.set(chunk.subarray(chunkOffset, chunkOffset + toCopy), leafFilled);
-          leafFilled += toCopy;
-          chunkOffset += toCopy;
-
-          if (leafFilled === leaf.size) {
-            // Queue for dispatch (non-blocking)
-            pendingDispatches.push({
-              slotIdx: currentSlotIdx, leaf, leafId: leaf.id, leafSize: leaf.size
-            });
-            tryDispatchPending();
-
-            currentLeafIdx++;
-            if (currentLeafIdx < leaves.length) {
-              // Find next free slot -- only blocks if ALL slots busy
-              let nextSlot = this.#findFreeSlot();
-              while (nextSlot === -1) {
-                await new Promise(r => { resolveSlot = r; });
-                tryDispatchPending();
-                nextSlot = this.#findFreeSlot();
-              }
-              currentSlotIdx = nextSlot;
-              this.#slotInUse[currentSlotIdx] = true;
-              slotView = new Uint8Array(this.#sab, currentSlotIdx * this.#chunkSize, leaves[currentLeafIdx].size);
-              leafFilled = 0;
-            }
-          }
-        }
-      }
-    } finally {
-      reader.releaseLock();
+      this.#slotInUse[slotIdx] = true;
+      inFlightReads.push(readAndDispatch(leaves[i], slotIdx));
     }
 
-    // Drain any remaining pending dispatches
-    while (pendingDispatches.length > 0) {
-      tryDispatchPending();
-      if (pendingDispatches.length > 0) {
-        await new Promise(r => { resolveSlot = r; });
-      }
-    }
+    await Promise.all(inFlightReads);
 
     const finalHash = await rootPromise;
     for (let i = 0; i < workerStats.length; i++) {
