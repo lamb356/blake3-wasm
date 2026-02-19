@@ -97,6 +97,8 @@
     td.match { font-weight: bold; }
     td.match.yes { color: #4ade80; }
     td.match.no { color: #f87171; }
+    tr.skipped td { color: #666; }
+    td.speed.skipped-text { color: #666; font-weight: normal; font-style: italic; }
 
     #worker-stats { display: none; margin-bottom: 16px; }
     #worker-stats h2 { margin: 16px 0 8px; font-size: 16px; border-bottom: 1px solid #333; padding-bottom: 4px; }
@@ -373,6 +375,18 @@
       return { hex, timeMs, speed };
     }
 
+    function skipRow(rowId, reason) {
+      const row = document.getElementById(rowId);
+      const cells = row.querySelectorAll('td');
+      cells[1].textContent = '-';
+      cells[2].textContent = '-';
+      cells[3].textContent = reason;
+      cells[3].className = 'speed skipped-text';
+      cells[4].textContent = 'N/A';
+      cells[4].className = 'match';
+      row.className = 'skipped';
+    }
+
     function markMatch(rowId, match) {
       const cells = document.getElementById(rowId).querySelectorAll('td');
       cells[4].textContent = match ? 'YES' : 'NO';
@@ -486,11 +500,17 @@
       }
 
       // Read file data for SAB, single-threaded, and SHA-256 methods
-      statusEl.textContent = 'Reading file...';
-      const data = new Uint8Array(await file.arrayBuffer());
+      const MAX_FULL_READ_SIZE = 512 * 1024 * 1024; // 512 MiB
+      const fullReadOk = file.size <= MAX_FULL_READ_SIZE;
+      let data = null;
+
+      if (fullReadOk) {
+        statusEl.textContent = 'Reading file...';
+        data = new Uint8Array(await file.arrayBuffer());
+      }
 
       // --- SAB Hasher ---
-      if (sabAvailable) {
+      if (sabAvailable && fullReadOk) {
         statusEl.textContent = 'Running SAB Hasher...';
         try {
           const hasher = new SABHasher({ workerCount, chunkSize });
@@ -517,13 +537,15 @@
           cells[4].textContent = 'ERROR';
           cells[4].className = 'match no';
         }
-      } else {
+      } else if (!sabAvailable) {
         const row = document.getElementById('row-sab');
         row.className = '';
         const cells = row.querySelectorAll('td');
         cells[1].textContent = 'SAB unavailable';
         cells[4].textContent = 'N/A';
         cells[4].className = 'match';
+      } else {
+        skipRow('row-sab', 'Skipped (file too large)');
       }
 
       // --- Streaming Hasher ---
@@ -555,52 +577,60 @@
       }
 
       // --- Single-threaded ---
-      statusEl.textContent = 'Running Single-threaded...';
-      try {
-        const times = [];
-        let lastHash;
-        for (let i = 0; i < ITERATIONS; i++) {
-          statusEl.textContent = `Single-threaded: iteration ${i + 1}/${ITERATIONS}`;
-          const t0 = performance.now();
-          lastHash = hashTree(data, 0, data.byteLength, true, chunkSize);
-          times.push(performance.now() - t0);
-        }
+      if (fullReadOk) {
+        statusEl.textContent = 'Running Single-threaded...';
+        try {
+          const times = [];
+          let lastHash;
+          for (let i = 0; i < ITERATIONS; i++) {
+            statusEl.textContent = `Single-threaded: iteration ${i + 1}/${ITERATIONS}`;
+            const t0 = performance.now();
+            lastHash = hashTree(data, 0, data.byteLength, true, chunkSize);
+            times.push(performance.now() - t0);
+          }
 
-        const med = median(times);
-        const hex = toHex(lastHash);
-        results.single = fillRow('row-single', hex, med, sizeMB);
-      } catch (err) {
-        const row = document.getElementById('row-single');
-        row.className = '';
-        const cells = row.querySelectorAll('td');
-        cells[1].textContent = err.message;
-        cells[4].textContent = 'ERROR';
-        cells[4].className = 'match no';
+          const med = median(times);
+          const hex = toHex(lastHash);
+          results.single = fillRow('row-single', hex, med, sizeMB);
+        } catch (err) {
+          const row = document.getElementById('row-single');
+          row.className = '';
+          const cells = row.querySelectorAll('td');
+          cells[1].textContent = err.message;
+          cells[4].textContent = 'ERROR';
+          cells[4].className = 'match no';
+        }
+      } else {
+        skipRow('row-single', 'Skipped (file too large)');
       }
 
       // --- SHA-256 (WebCrypto) ---
-      statusEl.textContent = 'Running SHA-256 (WebCrypto)...';
-      try {
-        const times = [];
-        let lastHash;
-        for (let i = 0; i < ITERATIONS; i++) {
-          statusEl.textContent = `SHA-256: iteration ${i + 1}/${ITERATIONS}`;
-          const t0 = performance.now();
-          const hashBuf = await crypto.subtle.digest('SHA-256', data.buffer);
-          times.push(performance.now() - t0);
-          lastHash = new Uint8Array(hashBuf);
-        }
+      if (fullReadOk) {
+        statusEl.textContent = 'Running SHA-256 (WebCrypto)...';
+        try {
+          const times = [];
+          let lastHash;
+          for (let i = 0; i < ITERATIONS; i++) {
+            statusEl.textContent = `SHA-256: iteration ${i + 1}/${ITERATIONS}`;
+            const t0 = performance.now();
+            const hashBuf = await crypto.subtle.digest('SHA-256', data.buffer);
+            times.push(performance.now() - t0);
+            lastHash = new Uint8Array(hashBuf);
+          }
 
-        const med = median(times);
-        const hex = toHex(lastHash);
-        results.sha256 = fillRow('row-sha256', hex, med, sizeMB);
-      } catch (err) {
-        const row = document.getElementById('row-sha256');
-        row.className = '';
-        const cells = row.querySelectorAll('td');
-        cells[1].textContent = err.message;
-        cells[4].textContent = 'ERROR';
-        cells[4].className = 'match no';
+          const med = median(times);
+          const hex = toHex(lastHash);
+          results.sha256 = fillRow('row-sha256', hex, med, sizeMB);
+        } catch (err) {
+          const row = document.getElementById('row-sha256');
+          row.className = '';
+          const cells = row.querySelectorAll('td');
+          cells[1].textContent = err.message;
+          cells[4].textContent = 'ERROR';
+          cells[4].className = 'match no';
+        }
+      } else {
+        skipRow('row-sha256', 'Skipped (file too large)');
       }
 
       // Check hash match
@@ -632,7 +662,8 @@
       if (bestRow) document.getElementById(bestRow).classList.add('best');
 
       const allMatch = hashes.length > 1 && hashes.every(h => h === refHash);
-      statusEl.textContent = `Benchmark complete (${workerCount} workers, ${chunkSize >= 1048576 ? (chunkSize / 1048576) + ' MiB' : (chunkSize / 1024) + ' KiB'} chunks). File: ${file.name} (${formatSize(file.size)}). ${allMatch ? 'All hashes match.' : 'Hash mismatch!'} Fastest BLAKE3: ${bestSpeed.toFixed(1)} MB/s${results.sha256 ? '. SHA-256: ' + results.sha256.speed.toFixed(1) + ' MB/s' : ''}`;
+      const skipNote = fullReadOk ? '' : ' File > 512 MiB \u2014 streaming hashers only.';
+      statusEl.textContent = `Benchmark complete (${workerCount} workers, ${chunkSize >= 1048576 ? (chunkSize / 1048576) + ' MiB' : (chunkSize / 1024) + ' KiB'} chunks). File: ${file.name} (${formatSize(file.size)}). ${allMatch ? 'All hashes match.' : 'Hash mismatch!'} Fastest BLAKE3: ${bestSpeed.toFixed(1)} MB/s${results.sha256 ? '. SHA-256: ' + results.sha256.speed.toFixed(1) + ' MB/s' : ''}${skipNote}`;
       runBtn.disabled = false;
     }
   </script>
