@@ -28,9 +28,10 @@ self.onmessage = async (e) => {
       return;
     }
     const { offset, size, taskId } = e.data;
+    const fileOffset = e.data.fileOffset ?? offset;
     try {
       const view = new Uint8Array(storedSAB, offset, size);
-      const cv = hash_subtree(view, BigInt(offset));
+      const cv = hash_subtree(view, BigInt(fileOffset));
       self.postMessage({ type: 'result', cv, offset, size, taskId });
     } catch (err) {
       self.postMessage({ type: 'error', error: err.message, taskId });

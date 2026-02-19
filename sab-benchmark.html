@@ -177,6 +177,13 @@
         <td class="speed">-</td>
         <td class="match">-</td>
       </tr>
+      <tr id="row-sab-stream" class="running">
+        <td>SAB Stream</td>
+        <td class="hash">-</td>
+        <td class="time">-</td>
+        <td class="speed">-</td>
+        <td class="match">-</td>
+      </tr>
       <tr id="row-streaming" class="running">
         <td>Streaming Hasher</td>
         <td class="hash">-</td>
@@ -220,6 +227,25 @@
     <div id="underrun-summary"></div>
   </div>
 
+  <div id="worker-stats-sab-stream" style="display: none; margin-bottom: 16px;">
+    <h2 style="margin: 16px 0 8px; font-size: 16px; border-bottom: 1px solid #333; padding-bottom: 4px;">Per-Worker Breakdown (SAB Stream)</h2>
+    <table>
+      <thead>
+        <tr>
+          <th>Worker</th>
+          <th>Tasks</th>
+          <th>Data (MB)</th>
+          <th>Time (ms)</th>
+          <th>Speed (MB/s)</th>
+          <th>Underruns</th>
+        </tr>
+      </thead>
+      <tbody id="worker-stats-sab-stream-body"></tbody>
+    </table>
+    <div id="worker-ratio-sab-stream"></div>
+    <div id="underrun-summary-sab-stream"></div>
+  </div>
+
   <details class="system-info">
     <summary>System Info</summary>
     <div>CPU Cores: <span class="val" id="info-cores">-</span></div>
@@ -232,6 +258,7 @@
   <script type="module">
     import wasmInit, { hash_single, hash_subtree, left_subtree_len, parent_cv, root_hash } from './blake3-wasm-streaming/pkg/blake3_wasm_streaming.js';
     import { SABHasher } from './sab-hasher.js';
+    import { SABStreamHasher } from './sab-stream-hasher.js';
     import { StreamingHasher } from './streaming-hasher.js';
 
     function toHex(bytes) {
@@ -352,12 +379,12 @@
       cells[4].className = 'match ' + (match ? 'yes' : 'no');
     }
 
-    function renderWorkerStats(stats) {
+    function renderWorkerStats(stats, sectionId = 'worker-stats', bodyId = 'worker-stats-body', ratioId = 'worker-ratio', underrunId = 'underrun-summary') {
       if (!stats || stats.length === 0) return;
-      const section = document.getElementById('worker-stats');
-      const tbody = document.getElementById('worker-stats-body');
-      const ratioEl = document.getElementById('worker-ratio');
-      const underrunEl = document.getElementById('underrun-summary');
+      const section = document.getElementById(sectionId);
+      const tbody = document.getElementById(bodyId);
+      const ratioEl = document.getElementById(ratioId);
+      const underrunEl = document.getElementById(underrunId);
       section.style.display = 'block';
       tbody.innerHTML = '';
 
@@ -405,23 +432,62 @@
     async function runBenchmark(file) {
       runBtn.disabled = true;
       resetRow('row-sab');
+      resetRow('row-sab-stream');
       resetRow('row-streaming');
       resetRow('row-single');
       resetRow('row-sha256');
       document.getElementById('worker-stats').style.display = 'none';
+      document.getElementById('worker-stats-sab-stream').style.display = 'none';
 
       const workerCount = parseInt(document.getElementById('worker-count').value, 10);
       const chunkSize = parseInt(document.getElementById('chunk-size').value, 10);
       const sizeMB = file.size / 1024 / 1024;
       const ITERATIONS = 3;
 
-      // Read file data for SAB and single-threaded methods
-      statusEl.textContent = 'Reading file...';
-      const data = new Uint8Array(await file.arrayBuffer());
-
       await wasmInit();
 
       const results = {};
+
+      // --- SAB Stream Hasher (streams from file, no full read needed) ---
+      if (sabAvailable) {
+        statusEl.textContent = 'Running SAB Stream Hasher...';
+        try {
+          const hasher = new SABStreamHasher({ workerCount, chunkSize });
+          await hasher.init();
+
+          const runs = [];
+          for (let i = 0; i < ITERATIONS; i++) {
+            statusEl.textContent = `SAB Stream: iteration ${i + 1}/${ITERATIONS}`;
+            const { hash, timeMs, workerStats: ws } = await hasher.hashFile(file);
+            runs.push({ hash, timeMs, workerStats: ws });
+          }
+
+          hasher.terminate();
+          const sorted = runs.map((r, i) => ({ i, t: r.timeMs })).sort((a, b) => a.t - b.t);
+          const medianRun = runs[sorted[Math.floor(sorted.length / 2)].i];
+          const hex = toHex(medianRun.hash);
+          results.sabStream = fillRow('row-sab-stream', hex, medianRun.timeMs, sizeMB);
+          renderWorkerStats(medianRun.workerStats, 'worker-stats-sab-stream', 'worker-stats-sab-stream-body', 'worker-ratio-sab-stream', 'underrun-summary-sab-stream');
+        } catch (err) {
+          const row = document.getElementById('row-sab-stream');
+          row.className = '';
+          const cells = row.querySelectorAll('td');
+          cells[1].textContent = err.message;
+          cells[4].textContent = 'ERROR';
+          cells[4].className = 'match no';
+        }
+      } else {
+        const row = document.getElementById('row-sab-stream');
+        row.className = '';
+        const cells = row.querySelectorAll('td');
+        cells[1].textContent = 'SAB unavailable';
+        cells[4].textContent = 'N/A';
+        cells[4].className = 'match';
+      }
+
+      // Read file data for SAB, single-threaded, and SHA-256 methods
+      statusEl.textContent = 'Reading file...';
+      const data = new Uint8Array(await file.arrayBuffer());
 
       // --- SAB Hasher ---
       if (sabAvailable) {
@@ -540,11 +606,13 @@
       // Check hash match
       const hashes = [];
       if (results.sab) hashes.push(results.sab.hex);
+      if (results.sabStream) hashes.push(results.sabStream.hex);
       if (results.streaming) hashes.push(results.streaming.hex);
       if (results.single) hashes.push(results.single.hex);
 
       const refHash = hashes[0];
       if (results.sab) markMatch('row-sab', results.sab.hex === refHash);
+      if (results.sabStream) markMatch('row-sab-stream', results.sabStream.hex === refHash);
       if (results.streaming) markMatch('row-streaming', results.streaming.hex === refHash);
       if (results.single) markMatch('row-single', results.single.hex === refHash);
 
@@ -558,6 +626,7 @@
       let bestRow = null;
       let bestSpeed = 0;
       if (results.sab && results.sab.speed > bestSpeed) { bestSpeed = results.sab.speed; bestRow = 'row-sab'; }
+      if (results.sabStream && results.sabStream.speed > bestSpeed) { bestSpeed = results.sabStream.speed; bestRow = 'row-sab-stream'; }
       if (results.streaming && results.streaming.speed > bestSpeed) { bestSpeed = results.streaming.speed; bestRow = 'row-streaming'; }
       if (results.single && results.single.speed > bestSpeed) { bestSpeed = results.single.speed; bestRow = 'row-single'; }
       if (bestRow) document.getElementById(bestRow).classList.add('best');
