@@ -1,0 +1,264 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <title>BLAKE3 Shared Memory WASM Test</title>
+  <script src="coi-serviceworker.min.js"></script>
+  <style>
+    body { font-family: monospace; max-width: 900px; margin: 2em auto; background: #1a1a2e; color: #e0e0e0; }
+    h1 { color: #00d4ff; }
+    .test { border: 1px solid #333; border-radius: 6px; padding: 1em; margin: 1em 0; }
+    .test h2 { margin-top: 0; }
+    .pass { border-color: #0f0; background: #0f01; }
+    .fail { border-color: #f00; background: #f001; }
+    .running { border-color: #ff0; background: #ff01; }
+    .label { color: #888; }
+    .hash { color: #0ff; word-break: break-all; }
+    .ok { color: #0f0; font-weight: bold; }
+    .err { color: #f00; font-weight: bold; }
+    pre { white-space: pre-wrap; }
+    #run-btn { font-size: 1.2em; padding: 0.5em 2em; cursor: pointer; background: #00d4ff; color: #000; border: none; border-radius: 4px; }
+    #run-btn:disabled { opacity: 0.5; cursor: not-allowed; }
+  </style>
+</head>
+<body>
+  <h1>BLAKE3 Shared Memory WASM Tests</h1>
+  <p>Tests that the shared-memory WASM module (compiled with <code>--shared-memory</code> + <code>--import-memory</code>) produces a <code>SharedArrayBuffer</code> heap and works correctly across Web Workers.</p>
+  <button id="run-btn" onclick="runAllTests()">Run Tests</button>
+  <div id="results"></div>
+
+<script type="module">
+  // Make runAllTests available globally
+  window.runAllTests = runAllTests;
+
+  const resultsEl = document.getElementById('results');
+  const runBtn = document.getElementById('run-btn');
+
+  function hex(bytes) {
+    return Array.from(bytes).map(b => b.toString(16).padStart(2, '0')).join('');
+  }
+
+  function arraysEqual(a, b) {
+    if (a.length !== b.length) return false;
+    for (let i = 0; i < a.length; i++) { if (a[i] !== b[i]) return false; }
+    return true;
+  }
+
+  function addTest(id, title) {
+    const div = document.createElement('div');
+    div.className = 'test running';
+    div.id = id;
+    div.innerHTML = `<h2>${title}</h2><pre class="log">Running...</pre>`;
+    resultsEl.appendChild(div);
+    return div;
+  }
+
+  function setTestResult(div, pass, html) {
+    div.className = pass ? 'test pass' : 'test fail';
+    div.querySelector('.log').innerHTML = html;
+  }
+
+  function waitForMsg(worker, type) {
+    return new Promise((resolve, reject) => {
+      const timeout = setTimeout(() => reject(new Error(`Timeout waiting for ${type}`)), 15000);
+      worker.onmessage = (e) => {
+        if (e.data.type === type) {
+          clearTimeout(timeout);
+          resolve(e.data);
+        }
+      };
+      worker.onerror = (e) => {
+        clearTimeout(timeout);
+        reject(new Error(`Worker error: ${e.message}`));
+      };
+    });
+  }
+
+  async function runAllTests() {
+    runBtn.disabled = true;
+    resultsEl.innerHTML = '';
+
+    let sharedPkg, sharedWasm, streamingPkg;
+
+    // ═══ Load modules ═══
+    try {
+      sharedPkg = await import('./blake3-wasm-shared/pkg/blake3_wasm_shared.js');
+      sharedWasm = await sharedPkg.default();
+      // sharedWasm = instance.exports, sharedWasm.memory = WebAssembly.Memory
+    } catch (e) {
+      resultsEl.innerHTML = `<div class="test fail"><h2>Module Load Failed</h2><pre class="log"><span class="err">Failed to load blake3-wasm-shared:</span>\n${e.message}\n${e.stack}</pre></div>`;
+      runBtn.disabled = false;
+      return;
+    }
+
+    try {
+      streamingPkg = await import('./blake3-wasm-streaming/pkg/blake3_wasm_streaming.js');
+      await streamingPkg.default();
+    } catch (e) {
+      resultsEl.innerHTML += `<div class="test fail"><h2>Streaming Module Load Failed</h2><pre class="log"><span class="err">Failed to load blake3-wasm-streaming:</span>\n${e.message}\n${e.stack}</pre></div>`;
+      runBtn.disabled = false;
+      return;
+    }
+
+    // ═══ Test 1: Memory type check ═══
+    {
+      const div = addTest('test1', 'Test 1 — Memory Type Check');
+      const isSAB = sharedWasm.memory.buffer instanceof SharedArrayBuffer;
+      const bufferType = sharedWasm.memory.buffer.constructor.name;
+      setTestResult(div, isSAB,
+        `<span class="label">memory.buffer type:</span> <span class="hash">${bufferType}</span>\n` +
+        `<span class="label">instanceof SharedArrayBuffer:</span> ${isSAB ? '<span class="ok">true ✓</span>' : '<span class="err">false ✗</span>'}\n` +
+        `<span class="label">crossOriginIsolated:</span> ${crossOriginIsolated}`
+      );
+    }
+
+    // ═══ Test 2: Hash correctness (shared vs non-shared) ═══
+    {
+      const div = addTest('test2', 'Test 2 — Hash Correctness (Shared vs Streaming)');
+      try {
+        const testStr = "hello world blake3 shared memory test";
+        const testData = new TextEncoder().encode(testStr);
+
+        const sharedSingle = sharedPkg.hash_single(testData);
+        const streamingSingle = streamingPkg.hash_single(testData);
+        const singleMatch = arraysEqual(sharedSingle, streamingSingle);
+
+        const sharedSubtree = sharedPkg.hash_subtree(testData, 0n);
+        const streamingSubtree = streamingPkg.hash_subtree(testData, 0n);
+        const subtreeMatch = arraysEqual(sharedSubtree, streamingSubtree);
+
+        const pass = singleMatch && subtreeMatch;
+        setTestResult(div, pass,
+          `<span class="label">Input:</span> "${testStr}"\n\n` +
+          `<span class="label">hash_single (shared):</span>    <span class="hash">${hex(sharedSingle)}</span>\n` +
+          `<span class="label">hash_single (streaming):</span> <span class="hash">${hex(streamingSingle)}</span>\n` +
+          `<span class="label">Match:</span> ${singleMatch ? '<span class="ok">YES ✓</span>' : '<span class="err">NO ✗</span>'}\n\n` +
+          `<span class="label">hash_subtree(data, 0) (shared):</span>    <span class="hash">${hex(sharedSubtree)}</span>\n` +
+          `<span class="label">hash_subtree(data, 0) (streaming):</span> <span class="hash">${hex(streamingSubtree)}</span>\n` +
+          `<span class="label">Match:</span> ${subtreeMatch ? '<span class="ok">YES ✓</span>' : '<span class="err">NO ✗</span>'}`
+        );
+      } catch (e) {
+        setTestResult(div, false, `<span class="err">Error:</span> ${e.message}\n${e.stack}`);
+      }
+    }
+
+    // ═══ Test 3: alloc_input + hash_subtree_ptr ═══
+    {
+      const div = addTest('test3', 'Test 3 — alloc_input / hash_subtree_ptr');
+      try {
+        const size = 1048576; // 1 MiB
+        const testData = new Uint8Array(size);
+        // Fill with deterministic PRNG pattern (simple xorshift)
+        let seed = 0xDEADBEEF;
+        for (let i = 0; i < size; i++) {
+          seed ^= seed << 13; seed ^= seed >> 17; seed ^= seed << 5;
+          testData[i] = seed & 0xFF;
+        }
+
+        // Path A: normal wasm-bindgen (copies data in)
+        const hashA = sharedPkg.hash_subtree(testData, 0n);
+
+        // Path B: pointer-based (write directly to WASM heap)
+        const ptr = sharedPkg.alloc_input(size);
+        new Uint8Array(sharedWasm.memory.buffer, ptr, size).set(testData);
+        const hashB = sharedPkg.hash_subtree_ptr(ptr, size, 0n);
+        sharedPkg.free_input(ptr, size);
+
+        const match = arraysEqual(hashA, hashB);
+        setTestResult(div, match,
+          `<span class="label">Data size:</span> ${size} bytes (1 MiB, deterministic PRNG fill)\n\n` +
+          `<span class="label">hash_subtree (wasm-bindgen):</span>  <span class="hash">${hex(hashA)}</span>\n` +
+          `<span class="label">hash_subtree_ptr (pointer):</span>   <span class="hash">${hex(hashB)}</span>\n` +
+          `<span class="label">Match:</span> ${match ? '<span class="ok">YES ✓</span>' : '<span class="err">NO ✗</span>'}`
+        );
+      } catch (e) {
+        setTestResult(div, false, `<span class="err">Error:</span> ${e.message}\n${e.stack}`);
+      }
+    }
+
+    // ═══ Test 4: Shared memory across workers ═══
+    {
+      const div = addTest('test4', 'Test 4 — Shared Memory Across Workers');
+      try {
+        // Compile the WASM module from bytes
+        const wasmBytes = await fetch('./blake3-wasm-shared/pkg/blake3_wasm_shared_bg.wasm').then(r => r.arrayBuffer());
+        const compiledModule = await WebAssembly.compile(wasmBytes);
+
+        // Create 2 workers
+        const w1 = new Worker('./shared-wasm-test-worker.js', { type: 'module' });
+        const w2 = new Worker('./shared-wasm-test-worker.js', { type: 'module' });
+
+        // Init workers with shared module + memory
+        w1.postMessage({ type: 'init', module: compiledModule, memory: sharedWasm.memory });
+        await waitForMsg(w1, 'ready');
+
+        w2.postMessage({ type: 'init', module: compiledModule, memory: sharedWasm.memory });
+        await waitForMsg(w2, 'ready');
+
+        // Prepare 2 data regions
+        const size = 1048576; // 1 MiB each
+        const dataA = new Uint8Array(size);
+        const dataB = new Uint8Array(size);
+        // Fill with different deterministic patterns
+        let seedA = 0xCAFEBABE;
+        for (let i = 0; i < size; i++) {
+          seedA ^= seedA << 13; seedA ^= seedA >> 17; seedA ^= seedA << 5;
+          dataA[i] = seedA & 0xFF;
+        }
+        let seedB = 0x12345678;
+        for (let i = 0; i < size; i++) {
+          seedB ^= seedB << 13; seedB ^= seedB >> 17; seedB ^= seedB << 5;
+          dataB[i] = seedB & 0xFF;
+        }
+
+        // Allocate in shared WASM heap and write data
+        const ptrA = sharedPkg.alloc_input(size);
+        const ptrB = sharedPkg.alloc_input(size);
+        new Uint8Array(sharedWasm.memory.buffer, ptrA, size).set(dataA);
+        new Uint8Array(sharedWasm.memory.buffer, ptrB, size).set(dataB);
+
+        // Worker 1 hashes region A (sequential to avoid allocator races)
+        w1.postMessage({ type: 'hash', ptr: ptrA, size, offset: 0, taskId: 'A' });
+        const resultA = await waitForMsg(w1, 'result');
+
+        // Worker 2 hashes region B
+        w2.postMessage({ type: 'hash', ptr: ptrB, size, offset: 0, taskId: 'B' });
+        const resultB = await waitForMsg(w2, 'result');
+
+        // Main-thread reference hashes
+        const expectedA = sharedPkg.hash_subtree(dataA, 0n);
+        const expectedB = sharedPkg.hash_subtree(dataB, 0n);
+
+        const matchA = arraysEqual(resultA.cv, expectedA);
+        const matchB = arraysEqual(resultB.cv, expectedB);
+        const pass = matchA && matchB;
+
+        // Cleanup
+        sharedPkg.free_input(ptrA, size);
+        sharedPkg.free_input(ptrB, size);
+        w1.terminate();
+        w2.terminate();
+
+        setTestResult(div, pass,
+          `<span class="label">Workers initialized:</span> 2 (each received compiled Module + shared Memory)\n` +
+          `<span class="label">Data per worker:</span> ${size} bytes (1 MiB)\n` +
+          `<span class="label">Execution:</span> sequential (avoids allocator races)\n\n` +
+          `<span class="label">Worker 1 hash:</span>   <span class="hash">${hex(resultA.cv)}</span>\n` +
+          `<span class="label">Expected (main):</span> <span class="hash">${hex(expectedA)}</span>\n` +
+          `<span class="label">Match:</span> ${matchA ? '<span class="ok">YES ✓</span>' : '<span class="err">NO ✗</span>'}\n\n` +
+          `<span class="label">Worker 2 hash:</span>   <span class="hash">${hex(resultB.cv)}</span>\n` +
+          `<span class="label">Expected (main):</span> <span class="hash">${hex(expectedB)}</span>\n` +
+          `<span class="label">Match:</span> ${matchB ? '<span class="ok">YES ✓</span>' : '<span class="err">NO ✗</span>'}\n\n` +
+          `<span class="label">Note:</span> Workers ran sequentially to avoid concurrent WASM allocator races.\n` +
+          `hash_subtree_ptr return value (Vec&lt;u8&gt;) allocates on the shared heap.`
+        );
+      } catch (e) {
+        setTestResult(div, false, `<span class="err">Error:</span> ${e.message}\n${e.stack}`);
+      }
+    }
+
+    runBtn.disabled = false;
+  }
+</script>
+</body>
+</html>

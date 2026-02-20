@@ -1,0 +1,15 @@
+{
+  "name": "blake3_wasm_shared",
+  "type": "module",
+  "version": "0.1.0",
+  "files": [
+    "blake3_wasm_shared_bg.wasm",
+    "blake3_wasm_shared.js",
+    "blake3_wasm_shared.d.ts"
+  ],
+  "main": "blake3_wasm_shared.js",
+  "types": "blake3_wasm_shared.d.ts",
+  "sideEffects": [
+    "./snippets/*"
+  ]
+}
