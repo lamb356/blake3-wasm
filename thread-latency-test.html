@@ -1,0 +1,354 @@
+<!DOCTYPE html>
+<html>
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Thread Notification Round-Trip Latency</title>
+  <style>
+    body {
+      font-family: system-ui, sans-serif;
+      max-width: 900px;
+      margin: 0 auto;
+      padding: 10px 15px;
+      background: #1a1a2e;
+      color: #eee;
+    }
+    h1 { text-align: center; margin: 8px 0; }
+    .subtitle { text-align: center; color: #888; margin-bottom: 10px; }
+
+    .system-bar {
+      background: #252540;
+      border-radius: 8px;
+      padding: 8px 14px;
+      margin-bottom: 12px;
+      font-size: 11px;
+      color: #888;
+      line-height: 1.6;
+      font-family: monospace;
+    }
+    .system-bar span.val { color: #bbb; }
+    .system-bar .ok { color: #4ade80; }
+    .system-bar .warn { color: #fbbf24; }
+
+    #run-btn {
+      display: block;
+      margin: 0 auto 12px;
+      background: #4a9eff;
+      color: white;
+      border: none;
+      padding: 10px 28px;
+      border-radius: 6px;
+      font-size: 15px;
+      cursor: pointer;
+    }
+    #run-btn:disabled { opacity: 0.5; cursor: not-allowed; }
+
+    #status {
+      text-align: center;
+      color: #888;
+      margin-bottom: 10px;
+      font-size: 14px;
+      min-height: 20px;
+    }
+
+    table {
+      width: 100%;
+      border-collapse: collapse;
+      margin-bottom: 16px;
+      font-size: 13px;
+    }
+    th {
+      background: #252540;
+      padding: 8px 10px;
+      text-align: left;
+      border-bottom: 2px solid #333;
+      color: #aaa;
+      font-size: 12px;
+      text-transform: uppercase;
+    }
+    td {
+      padding: 6px 10px;
+      border-bottom: 1px solid #2a2a40;
+      font-family: monospace;
+    }
+    tr.pending td { color: #666; }
+    tr.running td { color: #fbbf24; }
+    tr.best td { background: #1a3a1a; }
+    tr.skipped td { color: #666; font-style: italic; }
+
+    .note {
+      text-align: center;
+      color: #666;
+      font-size: 12px;
+      margin-top: 8px;
+    }
+  </style>
+</head>
+<body>
+  <h1>Thread Notification Round-Trip Latency</h1>
+  <p class="subtitle">postMessage vs Atomics vs Worker-to-Worker round-trip overhead</p>
+
+  <div class="system-bar" id="system-bar">Loading system info...</div>
+
+  <button id="run-btn">Run Benchmark</button>
+  <div id="status"></div>
+
+  <table>
+    <thead>
+      <tr>
+        <th>Method</th>
+        <th>Total (ms)</th>
+        <th>Avg RT (&micro;s)</th>
+        <th>Min RT (&micro;s)</th>
+        <th>Max RT (&micro;s)</th>
+        <th>Ops/sec</th>
+      </tr>
+    </thead>
+    <tbody id="results-body">
+      <tr id="row-postmsg" class="pending">
+        <td>postMessage (main&harr;worker)</td>
+        <td>-</td><td>-</td><td>-</td><td>-</td><td>-</td>
+      </tr>
+      <tr id="row-atomics" class="pending">
+        <td>Atomics (main&harr;worker)</td>
+        <td>-</td><td>-</td><td>-</td><td>-</td><td>-</td>
+      </tr>
+      <tr id="row-w2w" class="pending">
+        <td>postMessage (worker&harr;worker)</td>
+        <td>-</td><td>-</td><td>-</td><td>-</td><td>-</td>
+      </tr>
+    </tbody>
+  </table>
+
+  <p class="note">10,000 measured round trips per method (100 warm-up discarded). Each round trip is timed individually.</p>
+
+  <script src="coi-serviceworker.min.js"></script>
+  <script>
+    const ITERATIONS = 10000;
+    const WARMUP = 100;
+
+    const runBtn = document.getElementById('run-btn');
+    const statusEl = document.getElementById('status');
+
+    // --- System info ---
+    const coi = window.crossOriginIsolated;
+    const hasWaitAsync = typeof Atomics !== 'undefined' && typeof Atomics.waitAsync === 'function';
+    const sysBar = document.getElementById('system-bar');
+    sysBar.innerHTML = [
+      `Platform: <span class="val">${navigator.platform}</span>`,
+      `Cores: <span class="val">${navigator.hardwareConcurrency || 'unknown'}</span>`,
+      `Cross-Origin Isolated: <span class="${coi ? 'ok' : 'warn'}">${coi ? 'Yes' : 'No'}</span>`,
+      `Atomics.waitAsync: <span class="${hasWaitAsync ? 'ok' : 'warn'}">${hasWaitAsync ? 'Yes' : 'No'}</span>`,
+      `<br>UA: <span class="val">${navigator.userAgent}</span>`,
+    ].join(' &nbsp;|&nbsp; ');
+
+    // --- Helpers ---
+    function setRow(rowId, cls, cells) {
+      const row = document.getElementById(rowId);
+      row.className = cls;
+      const tds = row.querySelectorAll('td');
+      // cells is [total, avg, min, max, ops] or array of strings
+      for (let i = 0; i < cells.length; i++) {
+        tds[i + 1].textContent = cells[i];
+      }
+    }
+
+    function resetRow(rowId) {
+      setRow(rowId, 'pending', ['-', '-', '-', '-', '-']);
+    }
+
+    function statsFromTimes(times) {
+      let total = 0, min = Infinity, max = 0;
+      for (let i = 0; i < times.length; i++) {
+        total += times[i];
+        if (times[i] < min) min = times[i];
+        if (times[i] > max) max = times[i];
+      }
+      const avg = total / times.length;
+      return { total, avg, min, max, ops: Math.round(1000 / avg) };
+    }
+
+    function formatResult(stats) {
+      return [
+        stats.total.toFixed(1),
+        (stats.avg * 1000).toFixed(1),
+        (stats.min * 1000).toFixed(1),
+        (stats.max * 1000).toFixed(1),
+        stats.ops.toLocaleString(),
+      ];
+    }
+
+    // --- Benchmark 1: postMessage main↔worker ---
+    async function benchPostMessage() {
+      return new Promise((resolve, reject) => {
+        const worker = new Worker('thread-latency-worker.js');
+        const totalRounds = WARMUP + ITERATIONS;
+        const times = new Float64Array(ITERATIONS);
+        let round = 0;
+        let t0 = 0;
+
+        worker.onmessage = () => {
+          const elapsed = performance.now() - t0;
+          const measuredIndex = round - 1 - WARMUP;
+          if (measuredIndex >= 0) {
+            times[measuredIndex] = elapsed;
+          }
+
+          if (round >= totalRounds) {
+            worker.terminate();
+            resolve(statsFromTimes(times));
+            return;
+          }
+
+          t0 = performance.now();
+          worker.postMessage({ type: 'echo', seq: round });
+          round++;
+        };
+
+        // Kick off
+        t0 = performance.now();
+        worker.postMessage({ type: 'echo', seq: round });
+        round++;
+      });
+    }
+
+    // --- Benchmark 2: Atomics main↔worker ---
+    async function benchAtomics() {
+      if (!coi || !hasWaitAsync) {
+        return null; // Not supported
+      }
+
+      const worker = new Worker('thread-latency-worker.js');
+      const totalRounds = WARMUP + ITERATIONS;
+      const sab = new SharedArrayBuffer(8); // 2 Int32 slots
+      const view = new Int32Array(sab);
+
+      // Tell worker to start atomics loop
+      worker.postMessage({ type: 'atomics-start', sab, count: totalRounds });
+
+      const donePromise = new Promise((resolve) => {
+        worker.onmessage = (e) => {
+          if (e.data.type === 'atomics-done') resolve();
+        };
+      });
+
+      const times = new Float64Array(ITERATIONS);
+
+      for (let round = 0; round < totalRounds; round++) {
+        const t0 = performance.now();
+        // Signal worker: store (round + 1) into view[0]
+        Atomics.store(view, 0, round + 1);
+        Atomics.notify(view, 0);
+        // Wait for worker to store (round + 1) into view[1]
+        await Atomics.waitAsync(view, 1, round).value;
+        const elapsed = performance.now() - t0;
+
+        if (round >= WARMUP) {
+          times[round - WARMUP] = elapsed;
+        }
+      }
+
+      await donePromise;
+      worker.terminate();
+      return statsFromTimes(times);
+    }
+
+    // --- Benchmark 3: postMessage worker↔worker ---
+    async function benchW2W() {
+      return new Promise((resolve) => {
+        const driverWorker = new Worker('thread-latency-worker.js');
+        const responderWorker = new Worker('thread-latency-worker.js');
+        const channel = new MessageChannel();
+
+        // Send responder its port
+        responderWorker.postMessage(
+          { type: 'w2w-responder', port: channel.port1 },
+          [channel.port1]
+        );
+
+        // Listen for result from driver
+        driverWorker.onmessage = (e) => {
+          if (e.data.type === 'w2w-result') {
+            driverWorker.terminate();
+            responderWorker.terminate();
+            resolve({
+              total: e.data.total,
+              avg: e.data.avg,
+              min: e.data.min,
+              max: e.data.max,
+              ops: e.data.ops,
+            });
+          }
+        };
+
+        // Send driver its port + params
+        driverWorker.postMessage(
+          { type: 'w2w-driver', port: channel.port2, count: ITERATIONS, warmup: WARMUP },
+          [channel.port2]
+        );
+      });
+    }
+
+    // --- Run all ---
+    async function runAll() {
+      runBtn.disabled = true;
+      resetRow('row-postmsg');
+      resetRow('row-atomics');
+      resetRow('row-w2w');
+
+      const results = {};
+
+      // 1. postMessage main↔worker
+      setRow('row-postmsg', 'running', ['...', '...', '...', '...', '...']);
+      statusEl.textContent = 'Running postMessage (main↔worker)...';
+      try {
+        results.postmsg = await benchPostMessage();
+        setRow('row-postmsg', '', formatResult(results.postmsg));
+      } catch (err) {
+        setRow('row-postmsg', 'skipped', ['ERROR', err.message, '-', '-', '-']);
+      }
+
+      // 2. Atomics main↔worker
+      if (coi && hasWaitAsync) {
+        setRow('row-atomics', 'running', ['...', '...', '...', '...', '...']);
+        statusEl.textContent = 'Running Atomics (main↔worker)...';
+        try {
+          results.atomics = await benchAtomics();
+          if (results.atomics) {
+            setRow('row-atomics', '', formatResult(results.atomics));
+          } else {
+            setRow('row-atomics', 'skipped', ['-', '-', '-', '-', 'Not supported']);
+          }
+        } catch (err) {
+          setRow('row-atomics', 'skipped', ['ERROR', err.message, '-', '-', '-']);
+        }
+      } else {
+        setRow('row-atomics', 'skipped', ['-', '-', '-', '-', 'Not supported']);
+      }
+
+      // 3. postMessage worker↔worker
+      setRow('row-w2w', 'running', ['...', '...', '...', '...', '...']);
+      statusEl.textContent = 'Running postMessage (worker↔worker)...';
+      try {
+        results.w2w = await benchW2W();
+        setRow('row-w2w', '', formatResult(results.w2w));
+      } catch (err) {
+        setRow('row-w2w', 'skipped', ['ERROR', err.message, '-', '-', '-']);
+      }
+
+      // Highlight fastest average
+      let bestRow = null;
+      let bestAvg = Infinity;
+      if (results.postmsg && results.postmsg.avg < bestAvg) { bestAvg = results.postmsg.avg; bestRow = 'row-postmsg'; }
+      if (results.atomics && results.atomics.avg < bestAvg) { bestAvg = results.atomics.avg; bestRow = 'row-atomics'; }
+      if (results.w2w && results.w2w.avg < bestAvg) { bestAvg = results.w2w.avg; bestRow = 'row-w2w'; }
+      if (bestRow) document.getElementById(bestRow).classList.add('best');
+
+      statusEl.textContent = 'Benchmark complete.';
+      runBtn.disabled = false;
+    }
+
+    runBtn.addEventListener('click', runAll);
+  </script>
+</body>
+</html>
