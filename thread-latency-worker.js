@@ -41,6 +41,7 @@ self.onmessage = (e) => {
     const times = new Float64Array(count);
     let round = 0;
     let t0 = 0;
+    let wallStart = 0;
 
     port.onmessage = () => {
       if (round > 0) {
@@ -52,6 +53,7 @@ self.onmessage = (e) => {
       }
 
       if (round >= totalRounds) {
+        const wallEnd = performance.now();
         // Compute stats from measured rounds
         let total = 0, min = Infinity, max = 0;
         for (let i = 0; i < count; i++) {
@@ -66,17 +68,20 @@ self.onmessage = (e) => {
           avg,
           min,
           max,
-          ops: Math.round(1000 / avg)
+          ops: Math.round(1000 / avg),
+          wallClockTotal: wallEnd - wallStart,
         });
         return;
       }
 
+      if (round === warmup) wallStart = performance.now();
       t0 = performance.now();
       port.postMessage(round);
       round++;
     };
 
     // Kick off first round
+    if (warmup === 0) wallStart = performance.now();
     t0 = performance.now();
     port.postMessage(round);
     round++;

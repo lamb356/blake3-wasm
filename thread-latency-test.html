@@ -91,6 +91,11 @@
   <div class="system-bar" id="system-bar">Loading system info...</div>
 
   <button id="run-btn">Run Benchmark</button>
+  <select id="iter-select" style="display:block;margin:0 auto 10px;background:#252540;color:#eee;border:1px solid #444;padding:6px 10px;border-radius:6px;font-size:13px;cursor:pointer;">
+    <option value="10000" selected>10,000 iterations</option>
+    <option value="50000">50,000 iterations</option>
+    <option value="100000">100,000 iterations</option>
+  </select>
   <div id="status"></div>
 
   <table>
@@ -98,7 +103,8 @@
       <tr>
         <th>Method</th>
         <th>Total (ms)</th>
-        <th>Avg RT (&micro;s)</th>
+        <th>Wall Avg RT (&micro;s)</th>
+        <th>Per-trip Avg RT (&micro;s)</th>
         <th>Min RT (&micro;s)</th>
         <th>Max RT (&micro;s)</th>
         <th>Ops/sec</th>
@@ -107,28 +113,39 @@
     <tbody id="results-body">
       <tr id="row-postmsg" class="pending">
         <td>postMessage (main&harr;worker)</td>
-        <td>-</td><td>-</td><td>-</td><td>-</td><td>-</td>
+        <td>-</td><td>-</td><td>-</td><td>-</td><td>-</td><td>-</td>
       </tr>
       <tr id="row-atomics" class="pending">
         <td>Atomics (main&harr;worker)</td>
-        <td>-</td><td>-</td><td>-</td><td>-</td><td>-</td>
+        <td>-</td><td>-</td><td>-</td><td>-</td><td>-</td><td>-</td>
       </tr>
       <tr id="row-w2w" class="pending">
         <td>postMessage (worker&harr;worker)</td>
-        <td>-</td><td>-</td><td>-</td><td>-</td><td>-</td>
+        <td>-</td><td>-</td><td>-</td><td>-</td><td>-</td><td>-</td>
       </tr>
     </tbody>
   </table>
 
-  <p class="note">10,000 measured round trips per method (100 warm-up discarded). Each round trip is timed individually.</p>
+  <p class="note" id="note-text">10,000 measured round trips per method (100 warm-up discarded). Wall Avg RT uses a single coarse timer pair for accuracy on quantized timers (Safari/iOS).</p>
 
   <script src="coi-serviceworker.min.js"></script>
   <script>
-    const ITERATIONS = 10000;
     const WARMUP = 100;
 
     const runBtn = document.getElementById('run-btn');
     const statusEl = document.getElementById('status');
+
+    // --- Timer precision detection ---
+    function detectTimerPrecision() {
+      let minDiff = Infinity;
+      for (let i = 0; i < 1000; i++) {
+        const t0 = performance.now();
+        let t1 = t0;
+        while (t1 === t0) t1 = performance.now();
+        minDiff = Math.min(minDiff, t1 - t0);
+      }
+      return minDiff; // ms
+    }
 
     // --- System info ---
     const coi = window.crossOriginIsolated;
@@ -139,22 +156,30 @@
       `Cores: <span class="val">${navigator.hardwareConcurrency || 'unknown'}</span>`,
       `Cross-Origin Isolated: <span class="${coi ? 'ok' : 'warn'}">${coi ? 'Yes' : 'No'}</span>`,
       `Atomics.waitAsync: <span class="${hasWaitAsync ? 'ok' : 'warn'}">${hasWaitAsync ? 'Yes' : 'No'}</span>`,
+      `Timer precision: <span class="val" id="timer-precision">detecting...</span>`,
       `<br>UA: <span class="val">${navigator.userAgent}</span>`,
     ].join(' &nbsp;|&nbsp; ');
+
+    // Detect timer precision async to avoid blocking render
+    setTimeout(() => {
+      const precMs = detectTimerPrecision();
+      const precUs = (precMs * 1000).toFixed(1);
+      document.getElementById('timer-precision').textContent = `~${precUs}µs`;
+    }, 0);
 
     // --- Helpers ---
     function setRow(rowId, cls, cells) {
       const row = document.getElementById(rowId);
       row.className = cls;
       const tds = row.querySelectorAll('td');
-      // cells is [total, avg, min, max, ops] or array of strings
+      // cells is [total, wallAvg, perTripAvg, min, max, ops] or array of strings
       for (let i = 0; i < cells.length; i++) {
         tds[i + 1].textContent = cells[i];
       }
     }
 
     function resetRow(rowId) {
-      setRow(rowId, 'pending', ['-', '-', '-', '-', '-']);
+      setRow(rowId, 'pending', ['-', '-', '-', '-', '-', '-']);
     }
 
     function statsFromTimes(times) {
@@ -165,16 +190,18 @@
         if (times[i] > max) max = times[i];
       }
       const avg = total / times.length;
-      return { total, avg, min, max, ops: Math.round(1000 / avg) };
+      return { total, avg, min, max };
     }
 
     function formatResult(stats) {
+      const wallAvgUs = stats.wallClockAvg * 1000;
       return [
         stats.total.toFixed(1),
+        wallAvgUs.toFixed(1),
         (stats.avg * 1000).toFixed(1),
         (stats.min * 1000).toFixed(1),
         (stats.max * 1000).toFixed(1),
-        stats.ops.toLocaleString(),
+        Math.round(1e6 / wallAvgUs).toLocaleString(),
       ];
     }
 
@@ -182,10 +209,12 @@
     async function benchPostMessage() {
       return new Promise((resolve, reject) => {
         const worker = new Worker('thread-latency-worker.js');
+        const ITERATIONS = parseInt(document.getElementById('iter-select').value);
         const totalRounds = WARMUP + ITERATIONS;
         const times = new Float64Array(ITERATIONS);
         let round = 0;
         let t0 = 0;
+        let wallStart = 0;
 
         worker.onmessage = () => {
           const elapsed = performance.now() - t0;
@@ -195,17 +224,20 @@
           }
 
           if (round >= totalRounds) {
+            const wallEnd = performance.now();
             worker.terminate();
-            resolve(statsFromTimes(times));
+            resolve({ ...statsFromTimes(times), wallClockAvg: (wallEnd - wallStart) / ITERATIONS });
             return;
           }
 
+          if (round === WARMUP) wallStart = performance.now();
           t0 = performance.now();
           worker.postMessage({ type: 'echo', seq: round });
           round++;
         };
 
         // Kick off
+        if (WARMUP === 0) wallStart = performance.now();
         t0 = performance.now();
         worker.postMessage({ type: 'echo', seq: round });
         round++;
@@ -218,6 +250,7 @@
         return null; // Not supported
       }
 
+      const ITERATIONS = parseInt(document.getElementById('iter-select').value);
       const worker = new Worker('thread-latency-worker.js');
       const totalRounds = WARMUP + ITERATIONS;
       const sab = new SharedArrayBuffer(8); // 2 Int32 slots
@@ -233,8 +266,10 @@
       });
 
       const times = new Float64Array(ITERATIONS);
+      let wallStart = 0;
 
       for (let round = 0; round < totalRounds; round++) {
+        if (round === WARMUP) wallStart = performance.now();
         const t0 = performance.now();
         // Signal worker: store (round + 1) into view[0]
         Atomics.store(view, 0, round + 1);
@@ -248,13 +283,15 @@
         }
       }
 
+      const wallEnd = performance.now();
       await donePromise;
       worker.terminate();
-      return statsFromTimes(times);
+      return { ...statsFromTimes(times), wallClockAvg: (wallEnd - wallStart) / ITERATIONS };
     }
 
     // --- Benchmark 3: postMessage worker↔worker ---
     async function benchW2W() {
+      const ITERATIONS = parseInt(document.getElementById('iter-select').value);
       return new Promise((resolve) => {
         const driverWorker = new Worker('thread-latency-worker.js');
         const responderWorker = new Worker('thread-latency-worker.js');
@@ -276,7 +313,7 @@
               avg: e.data.avg,
               min: e.data.min,
               max: e.data.max,
-              ops: e.data.ops,
+              wallClockAvg: e.data.wallClockTotal / ITERATIONS,
             });
           }
         };
@@ -299,54 +336,62 @@
       const results = {};
 
       // 1. postMessage main↔worker
-      setRow('row-postmsg', 'running', ['...', '...', '...', '...', '...']);
+      setRow('row-postmsg', 'running', ['...', '...', '...', '...', '...', '...']);
       statusEl.textContent = 'Running postMessage (main↔worker)...';
       try {
         results.postmsg = await benchPostMessage();
         setRow('row-postmsg', '', formatResult(results.postmsg));
       } catch (err) {
-        setRow('row-postmsg', 'skipped', ['ERROR', err.message, '-', '-', '-']);
+        setRow('row-postmsg', 'skipped', ['ERROR', err.message, '-', '-', '-', '-']);
       }
 
       // 2. Atomics main↔worker
       if (coi && hasWaitAsync) {
-        setRow('row-atomics', 'running', ['...', '...', '...', '...', '...']);
+        setRow('row-atomics', 'running', ['...', '...', '...', '...', '...', '...']);
         statusEl.textContent = 'Running Atomics (main↔worker)...';
         try {
           results.atomics = await benchAtomics();
           if (results.atomics) {
             setRow('row-atomics', '', formatResult(results.atomics));
           } else {
-            setRow('row-atomics', 'skipped', ['-', '-', '-', '-', 'Not supported']);
+            setRow('row-atomics', 'skipped', ['-', '-', '-', '-', '-', 'Not supported']);
           }
         } catch (err) {
-          setRow('row-atomics', 'skipped', ['ERROR', err.message, '-', '-', '-']);
+          setRow('row-atomics', 'skipped', ['ERROR', err.message, '-', '-', '-', '-']);
         }
       } else {
-        setRow('row-atomics', 'skipped', ['-', '-', '-', '-', 'Not supported']);
+        setRow('row-atomics', 'skipped', ['-', '-', '-', '-', '-', 'Not supported']);
       }
 
       // 3. postMessage worker↔worker
-      setRow('row-w2w', 'running', ['...', '...', '...', '...', '...']);
+      setRow('row-w2w', 'running', ['...', '...', '...', '...', '...', '...']);
       statusEl.textContent = 'Running postMessage (worker↔worker)...';
       try {
         results.w2w = await benchW2W();
         setRow('row-w2w', '', formatResult(results.w2w));
       } catch (err) {
-        setRow('row-w2w', 'skipped', ['ERROR', err.message, '-', '-', '-']);
+        setRow('row-w2w', 'skipped', ['ERROR', err.message, '-', '-', '-', '-']);
       }
 
-      // Highlight fastest average
+      // Highlight fastest (by wall-clock avg)
       let bestRow = null;
       let bestAvg = Infinity;
-      if (results.postmsg && results.postmsg.avg < bestAvg) { bestAvg = results.postmsg.avg; bestRow = 'row-postmsg'; }
-      if (results.atomics && results.atomics.avg < bestAvg) { bestAvg = results.atomics.avg; bestRow = 'row-atomics'; }
-      if (results.w2w && results.w2w.avg < bestAvg) { bestAvg = results.w2w.avg; bestRow = 'row-w2w'; }
+      if (results.postmsg && results.postmsg.wallClockAvg < bestAvg) { bestAvg = results.postmsg.wallClockAvg; bestRow = 'row-postmsg'; }
+      if (results.atomics && results.atomics.wallClockAvg < bestAvg) { bestAvg = results.atomics.wallClockAvg; bestRow = 'row-atomics'; }
+      if (results.w2w && results.w2w.wallClockAvg < bestAvg) { bestAvg = results.w2w.wallClockAvg; bestRow = 'row-w2w'; }
       if (bestRow) document.getElementById(bestRow).classList.add('best');
 
       statusEl.textContent = 'Benchmark complete.';
       runBtn.disabled = false;
     }
+
+    function updateNote() {
+      const n = parseInt(document.getElementById('iter-select').value).toLocaleString();
+      document.getElementById('note-text').textContent =
+        `${n} measured round trips per method (100 warm-up discarded). Wall Avg RT uses a single coarse timer pair for accuracy on quantized timers (Safari/iOS).`;
+    }
+    document.getElementById('iter-select').addEventListener('change', updateNote);
+    updateNote();
 
     runBtn.addEventListener('click', runAll);
   </script>
