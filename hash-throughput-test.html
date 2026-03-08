@@ -1,0 +1,386 @@
+<!DOCTYPE html>
+<html>
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Single-Thread BLAKE3 Hash Throughput</title>
+  <style>
+    body {
+      font-family: system-ui, sans-serif;
+      max-width: 900px;
+      margin: 0 auto;
+      padding: 10px 15px;
+      background: #1a1a2e;
+      color: #eee;
+    }
+    h1 { text-align: center; margin: 8px 0; }
+    .subtitle { text-align: center; color: #888; margin-bottom: 10px; }
+
+    .system-bar {
+      background: #252540;
+      border-radius: 8px;
+      padding: 8px 14px;
+      margin-bottom: 12px;
+      font-size: 11px;
+      color: #888;
+      line-height: 1.6;
+      font-family: monospace;
+    }
+    .system-bar span.val { color: #bbb; }
+    .system-bar .ok { color: #4ade80; }
+    .system-bar .warn { color: #fbbf24; }
+
+    #run-btn {
+      display: block;
+      margin: 0 auto 12px;
+      background: #4a9eff;
+      color: white;
+      border: none;
+      padding: 10px 28px;
+      border-radius: 6px;
+      font-size: 15px;
+      cursor: pointer;
+    }
+    #run-btn:disabled { opacity: 0.5; cursor: not-allowed; }
+
+    #status {
+      text-align: center;
+      color: #888;
+      margin-bottom: 10px;
+      font-size: 14px;
+      min-height: 20px;
+    }
+
+    table {
+      width: 100%;
+      border-collapse: collapse;
+      margin-bottom: 16px;
+      font-size: 13px;
+    }
+    th {
+      background: #252540;
+      padding: 8px 10px;
+      text-align: left;
+      border-bottom: 2px solid #333;
+      color: #aaa;
+      font-size: 12px;
+    }
+    td {
+      padding: 6px 10px;
+      border-bottom: 1px solid #2a2a40;
+      font-family: monospace;
+    }
+    tr.pending td { color: #666; }
+    tr.running td { color: #fbbf24; }
+    tr.best td { background: #1a3a1a; }
+
+    canvas {
+      display: block;
+      width: 100%;
+      height: 350px;
+      margin-bottom: 12px;
+    }
+
+    .note {
+      text-align: center;
+      color: #666;
+      font-size: 12px;
+      margin-top: 8px;
+    }
+  </style>
+</head>
+<body>
+  <h1>Single-Thread BLAKE3 Hash Throughput</h1>
+  <p class="subtitle">ns/byte across buffer sizes &mdash; data pre-loaded in WASM heap</p>
+
+  <div class="system-bar" id="system-bar">Loading system info...</div>
+
+  <button id="run-btn" disabled>Run Benchmark</button>
+  <div id="status">Initializing WASM...</div>
+
+  <table>
+    <thead>
+      <tr>
+        <th>BUFFER SIZE</th>
+        <th>ITERATIONS</th>
+        <th>TOTAL (ms)</th>
+        <th>ns/hash</th>
+        <th>ns/byte</th>
+        <th>MB/s</th>
+      </tr>
+    </thead>
+    <tbody id="results-body"></tbody>
+  </table>
+
+  <canvas id="chart" width="900" height="350"></canvas>
+
+  <p class="note">Each buffer size calibrated to ~500 ms total. Inner loop contains only hash_subtree_ptr call. Single-threaded, data pre-allocated in WASM linear memory.</p>
+
+  <script src="coi-serviceworker.min.js"></script>
+  <script type="module">
+    import init, { alloc_input, free_input, hash_subtree_ptr } from './blake3-wasm-shared/pkg/blake3_wasm_shared.js';
+
+    const SIZES = [8, 16, 32, 64, 128, 256, 512, 1024, 2048, 4096,
+                   8192, 16384, 32768, 65536, 131072, 262144,
+                   524288, 1048576, 2097152, 4194304];
+
+    const runBtn = document.getElementById('run-btn');
+    const statusEl = document.getElementById('status');
+    const tbody = document.getElementById('results-body');
+    const canvas = document.getElementById('chart');
+
+    // --- Timer precision detection ---
+    function detectTimerPrecision() {
+      let minDiff = Infinity;
+      for (let i = 0; i < 1000; i++) {
+        const t0 = performance.now();
+        let t1 = t0;
+        while (t1 === t0) t1 = performance.now();
+        minDiff = Math.min(minDiff, t1 - t0);
+      }
+      return minDiff;
+    }
+
+    // --- System info ---
+    const coi = window.crossOriginIsolated;
+    const sysBar = document.getElementById('system-bar');
+    sysBar.innerHTML = [
+      `Platform: <span class="val">${navigator.platform}</span>`,
+      `Cores: <span class="val">${navigator.hardwareConcurrency || 'unknown'}</span>`,
+      `Cross-Origin Isolated: <span class="${coi ? 'ok' : 'warn'}">${coi ? 'Yes' : 'No'}</span>`,
+      `Timer precision: <span class="val" id="timer-precision">detecting...</span>`,
+      `<br>UA: <span class="val">${navigator.userAgent}</span>`,
+    ].join(' &nbsp;|&nbsp; ');
+
+    setTimeout(() => {
+      const precMs = detectTimerPrecision();
+      const precUs = (precMs * 1000).toFixed(1);
+      document.getElementById('timer-precision').textContent = `~${precUs}\u00b5s`;
+    }, 0);
+
+    // --- Helpers ---
+    function formatSize(bytes) {
+      if (bytes >= 1048576) return (bytes / 1048576) + ' MB';
+      if (bytes >= 1024) return (bytes / 1024) + ' KB';
+      return bytes + ' B';
+    }
+
+    // --- Build table rows ---
+    for (let i = 0; i < SIZES.length; i++) {
+      const tr = document.createElement('tr');
+      tr.id = 'row-' + i;
+      tr.className = 'pending';
+      tr.innerHTML = `<td>${formatSize(SIZES[i])}</td><td>-</td><td>-</td><td>-</td><td>-</td><td>-</td>`;
+      tbody.appendChild(tr);
+    }
+
+    // --- Calibration ---
+    function calibrateIterations(ptr, size, targetMs = 500) {
+      const t0 = performance.now();
+      for (let i = 0; i < 10; i++) {
+        hash_subtree_ptr(ptr, size, 0n);
+      }
+      const elapsed = performance.now() - t0;
+      const perHash = elapsed / 10;
+      return Math.max(100, Math.ceil(targetMs / perHash));
+    }
+
+    // --- Chart drawing ---
+    const results = [];
+
+    function drawChart() {
+      if (results.length === 0) return;
+      const ctx = canvas.getContext('2d');
+      const dpr = window.devicePixelRatio || 1;
+      const W = canvas.clientWidth * dpr;
+      const H = canvas.clientHeight * dpr;
+      canvas.width = W;
+      canvas.height = H;
+      ctx.scale(dpr, dpr);
+      const w = canvas.clientWidth;
+      const h = canvas.clientHeight;
+
+      const pad = { top: 20, right: 30, bottom: 50, left: 65 };
+      const plotW = w - pad.left - pad.right;
+      const plotH = h - pad.top - pad.bottom;
+
+      // Data ranges (log scale)
+      const xVals = results.map(r => Math.log10(r.size));
+      const yVals = results.map(r => Math.log10(r.nsPerByte));
+      const xMin = Math.floor(Math.min(...xVals));
+      const xMax = Math.ceil(Math.max(...xVals));
+      const yMin = Math.floor(Math.min(...yVals) * 10) / 10 - 0.1;
+      const yMax = Math.ceil(Math.max(...yVals) * 10) / 10 + 0.1;
+
+      function toX(logVal) { return pad.left + (logVal - xMin) / (xMax - xMin) * plotW; }
+      function toY(logVal) { return pad.top + (1 - (logVal - yMin) / (yMax - yMin)) * plotH; }
+
+      // Background
+      ctx.fillStyle = '#1a1a2e';
+      ctx.fillRect(0, 0, w, h);
+
+      // Grid lines
+      ctx.strokeStyle = '#2a2a40';
+      ctx.lineWidth = 1;
+      for (let x = xMin; x <= xMax; x++) {
+        const px = toX(x);
+        ctx.beginPath(); ctx.moveTo(px, pad.top); ctx.lineTo(px, pad.top + plotH); ctx.stroke();
+      }
+      for (let y = Math.ceil(yMin); y <= Math.floor(yMax + 1); y++) {
+        const py = toY(y);
+        if (py >= pad.top && py <= pad.top + plotH) {
+          ctx.beginPath(); ctx.moveTo(pad.left, py); ctx.lineTo(pad.left + plotW, py); ctx.stroke();
+        }
+      }
+
+      // Axes
+      ctx.strokeStyle = '#444';
+      ctx.lineWidth = 1;
+      ctx.beginPath(); ctx.moveTo(pad.left, pad.top); ctx.lineTo(pad.left, pad.top + plotH); ctx.lineTo(pad.left + plotW, pad.top + plotH); ctx.stroke();
+
+      // X labels
+      ctx.fillStyle = '#888';
+      ctx.font = '11px monospace';
+      ctx.textAlign = 'center';
+      for (const r of results) {
+        const px = toX(Math.log10(r.size));
+        ctx.save();
+        ctx.translate(px, pad.top + plotH + 8);
+        ctx.rotate(Math.PI / 4);
+        ctx.textAlign = 'left';
+        ctx.fillText(formatSize(r.size), 0, 0);
+        ctx.restore();
+      }
+
+      // Y labels
+      ctx.textAlign = 'right';
+      ctx.textBaseline = 'middle';
+      for (let y = Math.ceil(yMin); y <= Math.floor(yMax + 1); y++) {
+        const py = toY(y);
+        if (py >= pad.top && py <= pad.top + plotH) {
+          ctx.fillText(Math.pow(10, y).toFixed(y < 0 ? -y + 1 : 0), pad.left - 8, py);
+        }
+      }
+
+      // Y axis label
+      ctx.save();
+      ctx.translate(12, pad.top + plotH / 2);
+      ctx.rotate(-Math.PI / 2);
+      ctx.textAlign = 'center';
+      ctx.fillStyle = '#aaa';
+      ctx.font = '12px system-ui';
+      ctx.fillText('ns/byte', 0, 0);
+      ctx.restore();
+
+      // X axis label
+      ctx.fillStyle = '#aaa';
+      ctx.font = '12px system-ui';
+      ctx.textAlign = 'center';
+      ctx.fillText('Buffer Size', pad.left + plotW / 2, h - 4);
+
+      // Line
+      ctx.strokeStyle = '#4a9eff';
+      ctx.lineWidth = 2;
+      ctx.beginPath();
+      for (let i = 0; i < results.length; i++) {
+        const px = toX(Math.log10(results[i].size));
+        const py = toY(Math.log10(results[i].nsPerByte));
+        if (i === 0) ctx.moveTo(px, py); else ctx.lineTo(px, py);
+      }
+      ctx.stroke();
+
+      // Dots
+      ctx.fillStyle = '#4a9eff';
+      for (const r of results) {
+        const px = toX(Math.log10(r.size));
+        const py = toY(Math.log10(r.nsPerByte));
+        ctx.beginPath(); ctx.arc(px, py, 4, 0, Math.PI * 2); ctx.fill();
+      }
+    }
+
+    // --- WASM init ---
+    let wasmExports;
+    try {
+      wasmExports = await init();
+      statusEl.textContent = 'Ready.';
+      runBtn.disabled = false;
+    } catch (err) {
+      statusEl.textContent = 'WASM init failed: ' + err.message;
+    }
+
+    // --- Benchmark ---
+    async function runBenchmark() {
+      runBtn.disabled = true;
+      results.length = 0;
+      let bestIdx = -1;
+      let bestNsPerByte = Infinity;
+
+      // Reset rows
+      for (let i = 0; i < SIZES.length; i++) {
+        const row = document.getElementById('row-' + i);
+        row.className = 'pending';
+        const tds = row.querySelectorAll('td');
+        for (let j = 1; j < tds.length; j++) tds[j].textContent = '-';
+      }
+
+      for (let i = 0; i < SIZES.length; i++) {
+        const size = SIZES[i];
+        statusEl.textContent = `Hashing ${formatSize(size)} (${i + 1} of ${SIZES.length})...`;
+        const row = document.getElementById('row-' + i);
+        row.className = 'running';
+
+        // Yield to UI
+        await new Promise(r => setTimeout(r, 0));
+
+        // Allocate & fill
+        const ptr = alloc_input(size);
+        const view = new Uint8Array(wasmExports.memory.buffer);
+        for (let j = 0; j < size; j++) view[ptr + j] = j & 0xFF;
+
+        // Calibrate
+        const iterations = calibrateIterations(ptr, size);
+
+        // Timed inner loop
+        const t0 = performance.now();
+        for (let k = 0; k < iterations; k++) {
+          hash_subtree_ptr(ptr, size, 0n);
+        }
+        const t1 = performance.now();
+
+        const totalMs = t1 - t0;
+        const nsPerHash = totalMs * 1e6 / iterations;
+        const nsPerByte = nsPerHash / size;
+        const mbPerSec = (size * iterations) / (totalMs / 1000) / 1e6;
+
+        free_input(ptr, size);
+
+        // Track best
+        results.push({ size, nsPerByte });
+        if (nsPerByte < bestNsPerByte) {
+          bestNsPerByte = nsPerByte;
+          if (bestIdx >= 0) document.getElementById('row-' + bestIdx).classList.remove('best');
+          bestIdx = i;
+        }
+
+        // Update row
+        row.className = '';
+        const tds = row.querySelectorAll('td');
+        tds[1].textContent = iterations.toLocaleString();
+        tds[2].textContent = totalMs.toFixed(1);
+        tds[3].textContent = nsPerHash.toFixed(1);
+        tds[4].textContent = nsPerByte.toFixed(2);
+        tds[5].textContent = mbPerSec.toFixed(1);
+
+        if (bestIdx === i) row.classList.add('best');
+
+        drawChart();
+      }
+
+      statusEl.textContent = 'Benchmark complete.';
+      runBtn.disabled = false;
+    }
+
+    runBtn.addEventListener('click', runBenchmark);
+  </script>
+</body>
+</html>
