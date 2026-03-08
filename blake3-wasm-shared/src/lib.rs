@@ -76,3 +76,9 @@ pub fn hash_subtree_ptr(ptr: *const u8, size: usize, input_offset: u64) -> Vec<u
     let data = unsafe { std::slice::from_raw_parts(ptr, size) };
     do_hash_subtree(data, input_offset)
 }
+
+#[wasm_bindgen]
+pub fn hash_ptr(ptr: *const u8, size: usize) -> Vec<u8> {
+    let data = unsafe { std::slice::from_raw_parts(ptr, size) };
+    blake3::hash(data).as_bytes().to_vec()
+}

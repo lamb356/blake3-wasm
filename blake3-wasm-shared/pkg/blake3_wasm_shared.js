@@ -40,6 +40,18 @@ export function hash_chunk(data, chunk_index) {
 }
 
 /**
+ * @param {number} ptr
+ * @param {number} size
+ * @returns {Uint8Array}
+ */
+export function hash_ptr(ptr, size) {
+    const ret = wasm.hash_ptr(ptr, size);
+    var v1 = getArrayU8FromWasm0(ret[0], ret[1]).slice();
+    wasm.__wbindgen_free(ret[0], ret[1] * 1, 1);
+    return v1;
+}
+
+/**
  * @param {Uint8Array} data
  * @returns {Uint8Array}
  */

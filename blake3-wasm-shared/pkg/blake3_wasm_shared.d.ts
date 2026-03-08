@@ -9,6 +9,8 @@ export function free_input(ptr: number, size: number): void;
 
 export function hash_chunk(data: Uint8Array, chunk_index: bigint): Uint8Array;
 
+export function hash_ptr(ptr: number, size: number): Uint8Array;
+
 export function hash_single(data: Uint8Array): Uint8Array;
 
 export function hash_subtree(data: Uint8Array, input_offset: bigint): Uint8Array;
@@ -28,6 +30,7 @@ export interface InitOutput {
     readonly chunk_len: () => number;
     readonly free_input: (a: number, b: number) => void;
     readonly hash_chunk: (a: number, b: number, c: bigint) => [number, number];
+    readonly hash_ptr: (a: number, b: number) => [number, number];
     readonly hash_single: (a: number, b: number) => [number, number];
     readonly hash_subtree: (a: number, b: number, c: bigint) => [number, number];
     readonly hash_subtree_ptr: (a: number, b: number, c: bigint) => [number, number];

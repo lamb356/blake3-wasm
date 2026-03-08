@@ -30,6 +30,30 @@
     .system-bar .ok { color: #4ade80; }
     .system-bar .warn { color: #fbbf24; }
 
+    .controls {
+      display: flex;
+      justify-content: center;
+      gap: 12px;
+      align-items: center;
+      margin-bottom: 12px;
+      flex-wrap: wrap;
+    }
+    .controls label {
+      font-size: 12px;
+      color: #aaa;
+    }
+    .controls select {
+      background: #252540;
+      color: #eee;
+      border: 1px solid #444;
+      border-radius: 4px;
+      padding: 6px 10px;
+      font-size: 13px;
+      font-family: monospace;
+      cursor: pointer;
+    }
+    .controls select:focus { outline: 1px solid #4a9eff; }
+
     #run-btn {
       display: block;
       margin: 0 auto 12px;
@@ -91,9 +115,25 @@
 </head>
 <body>
   <h1>Single-Thread BLAKE3 Hash Throughput</h1>
-  <p class="subtitle">ns/byte across buffer sizes &mdash; data pre-loaded in WASM heap</p>
+  <p class="subtitle" id="subtitle">ns/byte across buffer sizes</p>
 
   <div class="system-bar" id="system-bar">Loading system info...</div>
+
+  <div class="controls">
+    <label>Sweep:
+      <select id="sweep-mode">
+        <option value="powers">Powers of 2 (8B &ndash; 4MB)</option>
+        <option value="fine">Fine sweep (64B &ndash; 5120B, every 64B)</option>
+      </select>
+    </label>
+    <label>Hash function:
+      <select id="hash-fn">
+        <option value="subtree_ptr">hash_subtree_ptr (pointer-based)</option>
+        <option value="single">hash_single (wasm-bindgen)</option>
+        <option value="hash_ptr">hash_ptr (blake3::hash, pointer-based)</option>
+      </select>
+    </label>
+  </div>
 
   <button id="run-btn" disabled>Run Benchmark</button>
   <div id="status">Initializing WASM...</div>
@@ -114,20 +154,40 @@
 
   <canvas id="chart" width="900" height="350"></canvas>
 
-  <p class="note">10,000 iterations per buffer size. Inner loop contains only hash_subtree_ptr call. Single-threaded, data pre-allocated in WASM linear memory.</p>
+  <p class="note">10,000 iterations per buffer size. Single-threaded, data pre-allocated in WASM linear memory.</p>
 
   <script src="coi-serviceworker.min.js"></script>
   <script type="module">
-    import init, { alloc_input, free_input, hash_subtree_ptr } from './blake3-wasm-shared/pkg/blake3_wasm_shared.js';
+    import init, { alloc_input, free_input, hash_subtree_ptr, hash_single, hash_ptr } from './blake3-wasm-shared/pkg/blake3_wasm_shared.js';
 
-    const SIZES = [8, 16, 32, 64, 128, 256, 512, 1024, 2048, 4096,
+    const SIZES_POWERS = [8, 16, 32, 64, 128, 256, 512, 1024, 2048, 4096,
                    8192, 16384, 32768, 65536, 131072, 262144,
                    524288, 1048576, 2097152, 4194304];
 
+    const SIZES_FINE = [];
+    for (let s = 64; s <= 5120; s += 64) SIZES_FINE.push(s);
+
+    const sweepSelect = document.getElementById('sweep-mode');
+    const hashFnSelect = document.getElementById('hash-fn');
     const runBtn = document.getElementById('run-btn');
     const statusEl = document.getElementById('status');
     const tbody = document.getElementById('results-body');
     const canvas = document.getElementById('chart');
+    const subtitleEl = document.getElementById('subtitle');
+
+    function getSizes() {
+      return sweepSelect.value === 'fine' ? SIZES_FINE : SIZES_POWERS;
+    }
+
+    function updateSubtitle() {
+      const sweepLabel = sweepSelect.options[sweepSelect.selectedIndex].text;
+      const hashLabel = hashFnSelect.options[hashFnSelect.selectedIndex].text;
+      subtitleEl.textContent = `ns/byte \u2014 ${sweepLabel} | ${hashLabel}`;
+    }
+
+    sweepSelect.addEventListener('change', updateSubtitle);
+    hashFnSelect.addEventListener('change', updateSubtitle);
+    updateSubtitle();
 
     // --- Timer precision detection ---
     function detectTimerPrecision() {
@@ -165,14 +225,19 @@
       return bytes + ' B';
     }
 
-    // --- Build table rows ---
-    for (let i = 0; i < SIZES.length; i++) {
-      const tr = document.createElement('tr');
-      tr.id = 'row-' + i;
-      tr.className = 'pending';
-      tr.innerHTML = `<td>${formatSize(SIZES[i])}</td><td>-</td><td>-</td><td>-</td><td>-</td><td>-</td>`;
-      tbody.appendChild(tr);
+    function buildRows(sizes) {
+      tbody.innerHTML = '';
+      for (let i = 0; i < sizes.length; i++) {
+        const tr = document.createElement('tr');
+        tr.id = 'row-' + i;
+        tr.className = 'pending';
+        tr.innerHTML = `<td>${formatSize(sizes[i])}</td><td>-</td><td>-</td><td>-</td><td>-</td><td>-</td>`;
+        tbody.appendChild(tr);
+      }
     }
+
+    // Build initial rows
+    buildRows(getSizes());
 
     // --- Chart drawing ---
     const results = [];
@@ -231,7 +296,11 @@
       ctx.fillStyle = '#888';
       ctx.font = '11px monospace';
       ctx.textAlign = 'center';
-      for (const r of results) {
+      // For fine sweep with 80 points, only label every 8th to avoid overlap
+      const labelEvery = results.length > 30 ? 8 : 1;
+      for (let i = 0; i < results.length; i++) {
+        if (i % labelEvery !== 0 && i !== results.length - 1) continue;
+        const r = results[i];
         const px = toX(Math.log10(r.size));
         ctx.save();
         ctx.translate(px, pad.top + plotH + 8);
@@ -280,10 +349,11 @@
 
       // Dots
       ctx.fillStyle = '#4a9eff';
+      const dotRadius = results.length > 30 ? 2.5 : 4;
       for (const r of results) {
         const px = toX(Math.log10(r.size));
         const py = toY(Math.log10(r.nsPerByte));
-        ctx.beginPath(); ctx.arc(px, py, 4, 0, Math.PI * 2); ctx.fill();
+        ctx.beginPath(); ctx.arc(px, py, dotRadius, 0, Math.PI * 2); ctx.fill();
       }
     }
 
@@ -300,21 +370,21 @@
     // --- Benchmark ---
     async function runBenchmark() {
       runBtn.disabled = true;
+      sweepSelect.disabled = true;
+      hashFnSelect.disabled = true;
       results.length = 0;
       let bestIdx = -1;
       let bestNsPerByte = Infinity;
 
-      // Reset rows
-      for (let i = 0; i < SIZES.length; i++) {
-        const row = document.getElementById('row-' + i);
-        row.className = 'pending';
-        const tds = row.querySelectorAll('td');
-        for (let j = 1; j < tds.length; j++) tds[j].textContent = '-';
-      }
+      const sizes = getSizes();
+      const hashFn = hashFnSelect.value;
 
-      for (let i = 0; i < SIZES.length; i++) {
-        const size = SIZES[i];
-        statusEl.textContent = `Hashing ${formatSize(size)} (${i + 1} of ${SIZES.length})...`;
+      // Rebuild table rows
+      buildRows(sizes);
+
+      for (let i = 0; i < sizes.length; i++) {
+        const size = sizes[i];
+        statusEl.textContent = `Hashing ${formatSize(size)} (${i + 1} of ${sizes.length})...`;
         const row = document.getElementById('row-' + i);
         row.className = 'running';
 
@@ -326,15 +396,33 @@
         const view = new Uint8Array(wasmExports.memory.buffer);
         for (let j = 0; j < size; j++) view[ptr + j] = j & 0xFF;
 
-        // Calibrate
         const iterations = 10000;
 
-        // Timed inner loop
-        const t0 = performance.now();
-        for (let k = 0; k < iterations; k++) {
-          hash_subtree_ptr(ptr, size, 0n);
+        // Timed inner loop — dispatch by hash function
+        let t0, t1;
+        if (hashFn === 'single') {
+          // Copy data out of WASM heap to avoid detached buffer if memory grows
+          const dataCopy = new Uint8Array(size);
+          dataCopy.set(new Uint8Array(wasmExports.memory.buffer, ptr, size));
+          t0 = performance.now();
+          for (let k = 0; k < iterations; k++) {
+            hash_single(dataCopy);
+          }
+          t1 = performance.now();
+        } else if (hashFn === 'hash_ptr') {
+          t0 = performance.now();
+          for (let k = 0; k < iterations; k++) {
+            hash_ptr(ptr, size);
+          }
+          t1 = performance.now();
+        } else {
+          // subtree_ptr (default)
+          t0 = performance.now();
+          for (let k = 0; k < iterations; k++) {
+            hash_subtree_ptr(ptr, size, 0n);
+          }
+          t1 = performance.now();
         }
-        const t1 = performance.now();
 
         const totalMs = t1 - t0;
         const nsPerHash = totalMs * 1e6 / iterations;
@@ -367,6 +455,8 @@
 
       statusEl.textContent = 'Benchmark complete.';
       runBtn.disabled = false;
+      sweepSelect.disabled = false;
+      hashFnSelect.disabled = false;
     }
 
     runBtn.addEventListener('click', runBenchmark);
