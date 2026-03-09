@@ -8,7 +8,7 @@ crate-type = ["cdylib"]
 
 [dependencies]
 wasm-bindgen = "0.2"
-blake3 = { version = "1", features = ["wasm32_simd"] }
+blake3 = { path = "../blake3-local", features = ["wasm32_simd"] }
 
 [profile.release]
 lto = true
