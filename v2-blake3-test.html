@@ -1,0 +1,266 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <title>V2 BLAKE3 API Test</title>
+  <script src="coi-serviceworker.min.js"></script>
+  <style>
+    body { font-family: monospace; max-width: 900px; margin: 2em auto; background: #1a1a2e; color: #e0e0e0; }
+    h1 { color: #00d4ff; }
+    .test { border: 1px solid #333; border-radius: 6px; padding: 1em; margin: 1em 0; }
+    .test h2 { margin-top: 0; }
+    .pass { border-color: #0f0; background: #0f01; }
+    .fail { border-color: #f00; background: #f001; }
+    .running { border-color: #ff0; background: #ff01; }
+    .label { color: #888; }
+    .hash { color: #0ff; word-break: break-all; }
+    .ok { color: #0f0; font-weight: bold; }
+    .err { color: #f00; font-weight: bold; }
+    pre { white-space: pre-wrap; }
+    #run-btn { font-size: 1.2em; padding: 0.5em 2em; cursor: pointer; background: #00d4ff; color: #000; border: none; border-radius: 4px; }
+    #run-btn:disabled { opacity: 0.5; cursor: not-allowed; }
+    #summary { margin-top: 1em; font-size: 1.1em; }
+  </style>
+</head>
+<body>
+  <h1>V2 BLAKE3 API Tests</h1>
+  <p>Tests the convenient single-message API: <code>hash()</code> and <code>hashStream()</code> with lazy auto-init.</p>
+  <button id="run-btn" onclick="runAllTests()">Run Tests</button>
+  <div id="summary"></div>
+  <div id="results"></div>
+
+<script type="module">
+  import { hash, hashStream } from './v2-blake3.js';
+
+  window.runAllTests = runAllTests;
+
+  const resultsEl = document.getElementById('results');
+  const summaryEl = document.getElementById('summary');
+  const runBtn = document.getElementById('run-btn');
+
+  const BLAKE3_EMPTY = 'af1349b9f5f9a1a6a0404dea36dcc9499bcb25c9adc112b7cc9a93cae41f3262';
+
+  // Load WASM pkg directly for ground truth
+  let pkg;
+
+  function hex(bytes) {
+    return Array.from(bytes).map(b => b.toString(16).padStart(2, '0')).join('');
+  }
+
+  function arraysEqual(a, b) {
+    if (a.length !== b.length) return false;
+    for (let i = 0; i < a.length; i++) { if (a[i] !== b[i]) return false; }
+    return true;
+  }
+
+  function addTest(id, title) {
+    const div = document.createElement('div');
+    div.className = 'test running';
+    div.id = id;
+    div.innerHTML = `<h2>${title}</h2><pre class="log">Running...</pre>`;
+    resultsEl.appendChild(div);
+    return div;
+  }
+
+  function setTestResult(div, pass, html) {
+    div.className = pass ? 'test pass' : 'test fail';
+    div.querySelector('.log').innerHTML = html;
+  }
+
+  function fillDeterministic(buf) {
+    for (let i = 0; i < buf.length; i++) buf[i] = i & 0xFF;
+  }
+
+  function makeStream(data, chunkSize = 16384) {
+    let pos = 0;
+    return new ReadableStream({
+      pull(controller) {
+        if (pos >= data.length) { controller.close(); return; }
+        const end = Math.min(pos + chunkSize, data.length);
+        controller.enqueue(data.slice(pos, end));
+        pos = end;
+      }
+    });
+  }
+
+  async function runAllTests() {
+    runBtn.disabled = true;
+    resultsEl.innerHTML = '';
+    summaryEl.innerHTML = '';
+
+    let passed = 0, failed = 0;
+
+    // Load WASM pkg for ground truth
+    try {
+      const mod = await import('./blake3-wasm-shared/pkg/blake3_wasm_shared.js');
+      await mod.default();
+      pkg = mod;
+    } catch (e) {
+      resultsEl.innerHTML = `<div class="test fail"><h2>WASM Init Failed</h2><pre class="log"><span class="err">${e.message}</span>\n${e.stack}</pre></div>`;
+      runBtn.disabled = false;
+      return;
+    }
+
+    function check(pass) { if (pass) passed++; else failed++; }
+
+    // ═══ Test 1: hash(Uint8Array) small — 5 B "hello" ═══
+    {
+      const div = addTest('t1', 'Test 1 — hash(Uint8Array) small (5 B "hello")');
+      try {
+        const data = new TextEncoder().encode('hello');
+        const result = await hash(data);
+        const ref = pkg.hash_single(data);
+        const pass = arraysEqual(result, ref);
+        check(pass);
+        setTestResult(div, pass,
+          `<span class="label">Result:</span>      <span class="hash">${hex(result)}</span>\n` +
+          `<span class="label">hash_single:</span> <span class="hash">${hex(ref)}</span>\n` +
+          `<span class="label">Match:</span> ${pass ? '<span class="ok">YES</span>' : '<span class="err">NO</span>'}\n` +
+          (pass ? '<span class="ok">PASS</span>' : '<span class="err">FAIL</span>')
+        );
+      } catch (e) { check(false); setTestResult(div, false, `<span class="err">Error:</span> ${e.message}\n${e.stack}`); }
+    }
+
+    // ═══ Test 2: hash(Uint8Array) large — 1 MiB ═══
+    const data1MiB = new Uint8Array(1048576);
+    fillDeterministic(data1MiB);
+    const ref1MiB = pkg.hash_single(data1MiB);
+    {
+      const div = addTest('t2', 'Test 2 — hash(Uint8Array) large (1 MiB)');
+      try {
+        const result = await hash(data1MiB);
+        const pass = arraysEqual(result, ref1MiB);
+        check(pass);
+        setTestResult(div, pass,
+          `<span class="label">Path:</span> hash → workers (1 MiB)\n` +
+          `<span class="label">Result:</span>      <span class="hash">${hex(result)}</span>\n` +
+          `<span class="label">hash_single:</span> <span class="hash">${hex(ref1MiB)}</span>\n` +
+          `<span class="label">Match:</span> ${pass ? '<span class="ok">YES</span>' : '<span class="err">NO</span>'}\n` +
+          (pass ? '<span class="ok">PASS</span>' : '<span class="err">FAIL</span>')
+        );
+      } catch (e) { check(false); setTestResult(div, false, `<span class="err">Error:</span> ${e.message}\n${e.stack}`); }
+    }
+
+    // ═══ Test 3: hash(ArrayBuffer) — 1 MiB ═══
+    {
+      const div = addTest('t3', 'Test 3 — hash(ArrayBuffer) (1 MiB)');
+      try {
+        const ab = data1MiB.buffer.slice(0);
+        const result = await hash(ab);
+        const pass = arraysEqual(result, ref1MiB);
+        check(pass);
+        setTestResult(div, pass,
+          `<span class="label">Input:</span> ArrayBuffer (auto-converted to Uint8Array)\n` +
+          `<span class="label">Result:</span>      <span class="hash">${hex(result)}</span>\n` +
+          `<span class="label">hash_single:</span> <span class="hash">${hex(ref1MiB)}</span>\n` +
+          `<span class="label">Match:</span> ${pass ? '<span class="ok">YES</span>' : '<span class="err">NO</span>'}\n` +
+          (pass ? '<span class="ok">PASS</span>' : '<span class="err">FAIL</span>')
+        );
+      } catch (e) { check(false); setTestResult(div, false, `<span class="err">Error:</span> ${e.message}\n${e.stack}`); }
+    }
+
+    // ═══ Test 4: hashStream small — 32 KiB ═══
+    {
+      const div = addTest('t4', 'Test 4 — hashStream small (32 KiB)');
+      try {
+        const data = new Uint8Array(32768);
+        fillDeterministic(data);
+        const ref = pkg.hash_single(data);
+        const stream = makeStream(data, 8192);
+        const result = await hashStream(stream);
+        const pass = arraysEqual(result, ref);
+        check(pass);
+        setTestResult(div, pass,
+          `<span class="label">Result:</span>      <span class="hash">${hex(result)}</span>\n` +
+          `<span class="label">hash_single:</span> <span class="hash">${hex(ref)}</span>\n` +
+          `<span class="label">Match:</span> ${pass ? '<span class="ok">YES</span>' : '<span class="err">NO</span>'}\n` +
+          (pass ? '<span class="ok">PASS</span>' : '<span class="err">FAIL</span>')
+        );
+      } catch (e) { check(false); setTestResult(div, false, `<span class="err">Error:</span> ${e.message}\n${e.stack}`); }
+    }
+
+    // ═══ Test 5: hashStream large — 1 MiB ═══
+    {
+      const div = addTest('t5', 'Test 5 — hashStream large (1 MiB)');
+      try {
+        const stream = makeStream(data1MiB, 16384);
+        const result = await hashStream(stream);
+        const pass = arraysEqual(result, ref1MiB);
+        check(pass);
+        setTestResult(div, pass,
+          `<span class="label">Result:</span>      <span class="hash">${hex(result)}</span>\n` +
+          `<span class="label">hash_single:</span> <span class="hash">${hex(ref1MiB)}</span>\n` +
+          `<span class="label">Match:</span> ${pass ? '<span class="ok">YES</span>' : '<span class="err">NO</span>'}\n` +
+          (pass ? '<span class="ok">PASS</span>' : '<span class="err">FAIL</span>')
+        );
+      } catch (e) { check(false); setTestResult(div, false, `<span class="err">Error:</span> ${e.message}\n${e.stack}`); }
+    }
+
+    // ═══ Test 6: Consistency — hash vs hashStream ═══
+    {
+      const div = addTest('t6', 'Test 6 — Consistency: hash() vs hashStream() (1 MiB)');
+      try {
+        const hashResult = await hash(data1MiB.slice());
+        const stream = makeStream(data1MiB, 16384);
+        const streamResult = await hashStream(stream);
+        const pass = arraysEqual(hashResult, streamResult);
+        check(pass);
+        setTestResult(div, pass,
+          `<span class="label">hash():</span>       <span class="hash">${hex(hashResult)}</span>\n` +
+          `<span class="label">hashStream():</span> <span class="hash">${hex(streamResult)}</span>\n` +
+          `<span class="label">Match:</span> ${pass ? '<span class="ok">YES</span>' : '<span class="err">NO</span>'}\n` +
+          (pass ? '<span class="ok">PASS</span>' : '<span class="err">FAIL</span>')
+        );
+      } catch (e) { check(false); setTestResult(div, false, `<span class="err">Error:</span> ${e.message}\n${e.stack}`); }
+    }
+
+    // ═══ Test 7: Auto-init — hash() works with no setup ═══
+    {
+      const div = addTest('t7', 'Test 7 — Auto-init: hash() works with no setup');
+      try {
+        // This test verifies that calling hash() "just works" —
+        // the singleton was already auto-initialized by prior tests,
+        // confirming the lazy init pattern functions correctly.
+        const data = new TextEncoder().encode('auto-init test');
+        const result = await hash(data);
+        const ref = pkg.hash_single(data);
+        const pass = arraysEqual(result, ref);
+        check(pass);
+        setTestResult(div, pass,
+          `<span class="label">No explicit init required</span>\n` +
+          `<span class="label">Result:</span>      <span class="hash">${hex(result)}</span>\n` +
+          `<span class="label">hash_single:</span> <span class="hash">${hex(ref)}</span>\n` +
+          `<span class="label">Match:</span> ${pass ? '<span class="ok">YES</span>' : '<span class="err">NO</span>'}\n` +
+          (pass ? '<span class="ok">PASS</span>' : '<span class="err">FAIL</span>')
+        );
+      } catch (e) { check(false); setTestResult(div, false, `<span class="err">Error:</span> ${e.message}\n${e.stack}`); }
+    }
+
+    // ═══ Test 8: Empty input — known BLAKE3 empty hash ═══
+    {
+      const div = addTest('t8', 'Test 8 — Empty input: hash(new Uint8Array(0))');
+      try {
+        const result = await hash(new Uint8Array(0));
+        const h = hex(result);
+        const pass = h === BLAKE3_EMPTY;
+        check(pass);
+        setTestResult(div, pass,
+          `<span class="label">Result:</span>   <span class="hash">${h}</span>\n` +
+          `<span class="label">Expected:</span> <span class="hash">${BLAKE3_EMPTY}</span>\n` +
+          `<span class="label">Match:</span> ${pass ? '<span class="ok">YES</span>' : '<span class="err">NO</span>'}\n` +
+          (pass ? '<span class="ok">PASS</span>' : '<span class="err">FAIL</span>')
+        );
+      } catch (e) { check(false); setTestResult(div, false, `<span class="err">Error:</span> ${e.message}\n${e.stack}`); }
+    }
+
+    // Summary
+    const allPass = failed === 0;
+    summaryEl.innerHTML = allPass
+      ? `<span class="ok">${passed}/${passed} tests passed</span>`
+      : `<span class="err">${failed} failed</span>, <span class="ok">${passed} passed</span> of ${passed + failed}`;
+
+    runBtn.disabled = false;
+  }
+</script>
+</body>
+</html>
