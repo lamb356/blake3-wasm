@@ -25,6 +25,20 @@ self.onmessage = (e) => {
     return;
   }
 
+  // Mode: Atomics parallel (main→N workers simultaneous signal/ack)
+  if (type === 'atomics-parallel') {
+    const { sab, workerSlot, count } = e.data;
+    const view = new Int32Array(sab);
+    // view[workerSlot] = main→worker, view[workerSlot+1] = worker→main
+    for (let round = 0; round < count; round++) {
+      Atomics.wait(view, workerSlot, round);
+      Atomics.store(view, workerSlot + 1, round + 1);
+      Atomics.notify(view, workerSlot + 1);
+    }
+    self.postMessage({ type: 'atomics-parallel-done' });
+    return;
+  }
+
   // Mode: worker-to-worker responder (echoes on MessagePort)
   if (type === 'w2w-responder') {
     const port = e.data.port;

@@ -122,6 +122,10 @@
         <td>postMessage (worker&harr;worker)</td>
         <td>-</td><td>-</td><td>-</td><td>-</td><td>-</td><td>-</td>
       </tr>
+      <tr id="row-atomics-par" class="pending">
+        <td>Atomics parallel (main&rarr;4 workers)</td>
+        <td>-</td><td>-</td><td>-</td><td>-</td><td>-</td><td>-</td>
+      </tr>
     </tbody>
   </table>
 
@@ -325,12 +329,68 @@
       });
     }
 
+    // --- Benchmark 4: Atomics parallel (main→4 workers) ---
+    async function benchAtomicsParallel() {
+      if (!coi || !hasWaitAsync) return null;
+
+      const NUM_WORKERS = 4;
+      const ITERATIONS = parseInt(document.getElementById('iter-select').value);
+      const totalRounds = WARMUP + ITERATIONS;
+      const sab = new SharedArrayBuffer(NUM_WORKERS * 2 * 4); // 4 workers × 2 slots × 4 bytes
+      const view = new Int32Array(sab);
+
+      // Spawn workers and collect done promises
+      const workers = [];
+      const donePromises = [];
+      for (let i = 0; i < NUM_WORKERS; i++) {
+        const w = new Worker('thread-latency-worker.js');
+        workers.push(w);
+        donePromises.push(new Promise((resolve) => {
+          w.onmessage = (e) => {
+            if (e.data.type === 'atomics-parallel-done') resolve();
+          };
+        }));
+        w.postMessage({ type: 'atomics-parallel', sab, workerSlot: i * 2, count: totalRounds });
+      }
+
+      const times = new Float64Array(ITERATIONS);
+      let wallStart = 0;
+
+      for (let round = 0; round < totalRounds; round++) {
+        if (round === WARMUP) wallStart = performance.now();
+        const t0 = performance.now();
+
+        // Signal all workers
+        const waitPromises = [];
+        for (let i = 0; i < NUM_WORKERS; i++) {
+          const slot = i * 2;
+          Atomics.store(view, slot, round + 1);
+          Atomics.notify(view, slot);
+          waitPromises.push(Atomics.waitAsync(view, slot + 1, round).value);
+        }
+
+        // Wait for all workers to ack
+        await Promise.all(waitPromises);
+
+        const elapsed = performance.now() - t0;
+        if (round >= WARMUP) {
+          times[round - WARMUP] = elapsed;
+        }
+      }
+
+      const wallEnd = performance.now();
+      await Promise.all(donePromises);
+      for (const w of workers) w.terminate();
+      return { ...statsFromTimes(times), wallClockAvg: (wallEnd - wallStart) / ITERATIONS };
+    }
+
     // --- Run all ---
     async function runAll() {
       runBtn.disabled = true;
       resetRow('row-postmsg');
       resetRow('row-atomics');
       resetRow('row-w2w');
+      resetRow('row-atomics-par');
 
       const results = {};
 
@@ -372,12 +432,31 @@
         setRow('row-w2w', 'skipped', ['ERROR', err.message, '-', '-', '-', '-']);
       }
 
+      // 4. Atomics parallel (main→4 workers)
+      if (coi && hasWaitAsync) {
+        setRow('row-atomics-par', 'running', ['...', '...', '...', '...', '...', '...']);
+        statusEl.textContent = 'Running Atomics parallel (main→4 workers)...';
+        try {
+          results.atomicsPar = await benchAtomicsParallel();
+          if (results.atomicsPar) {
+            setRow('row-atomics-par', '', formatResult(results.atomicsPar));
+          } else {
+            setRow('row-atomics-par', 'skipped', ['-', '-', '-', '-', '-', 'Not supported']);
+          }
+        } catch (err) {
+          setRow('row-atomics-par', 'skipped', ['ERROR', err.message, '-', '-', '-', '-']);
+        }
+      } else {
+        setRow('row-atomics-par', 'skipped', ['-', '-', '-', '-', '-', 'Not supported']);
+      }
+
       // Highlight fastest (by wall-clock avg)
       let bestRow = null;
       let bestAvg = Infinity;
       if (results.postmsg && results.postmsg.wallClockAvg < bestAvg) { bestAvg = results.postmsg.wallClockAvg; bestRow = 'row-postmsg'; }
       if (results.atomics && results.atomics.wallClockAvg < bestAvg) { bestAvg = results.atomics.wallClockAvg; bestRow = 'row-atomics'; }
       if (results.w2w && results.w2w.wallClockAvg < bestAvg) { bestAvg = results.w2w.wallClockAvg; bestRow = 'row-w2w'; }
+      if (results.atomicsPar && results.atomicsPar.wallClockAvg < bestAvg) { bestAvg = results.atomicsPar.wallClockAvg; bestRow = 'row-atomics-par'; }
       if (bestRow) document.getElementById(bestRow).classList.add('best');
 
       statusEl.textContent = 'Benchmark complete.';
@@ -387,7 +466,7 @@
     function updateNote() {
       const n = parseInt(document.getElementById('iter-select').value).toLocaleString();
       document.getElementById('note-text').textContent =
-        `${n} measured round trips per method (100 warm-up discarded). Wall Avg RT uses a single coarse timer pair for accuracy on quantized timers (Safari/iOS).`;
+        `${n} measured round trips per method (100 warm-up discarded). 4 methods tested. Wall Avg RT uses a single coarse timer pair for accuracy on quantized timers (Safari/iOS).`;
     }
     document.getElementById('iter-select').addEventListener('change', updateNote);
     updateNote();
