@@ -406,7 +406,7 @@ async function benchmarkSize(data, warmup, iterations) {
   // Warmup
   for (let i = 0; i < warmup; i++) {
     await hash(data);
-    await crypto.subtle.digest('SHA-256', data);
+    await crypto.subtle.digest('SHA-256', data.buffer);
   }
 
   // BLAKE3
@@ -416,7 +416,7 @@ async function benchmarkSize(data, warmup, iterations) {
 
   // SHA-256
   const shaStart = performance.now();
-  for (let i = 0; i < iterations; i++) await crypto.subtle.digest('SHA-256', data);
+  for (let i = 0; i < iterations; i++) await crypto.subtle.digest('SHA-256', data.buffer);
   const shaMs = (performance.now() - shaStart) / iterations;
 
   const sizeMB = data.byteLength / (1024 * 1024);
