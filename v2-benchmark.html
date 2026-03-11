@@ -433,6 +433,31 @@ async function runSyntheticBenchmark() {
   btn.disabled = true;
   results.innerHTML = '';
 
+  // ── Diagnostic: isolated WebCrypto SHA-256 speed ──
+  {
+    const diagBuf = new ArrayBuffer(1048576); // 1 MiB
+    // Warmup
+    await crypto.subtle.digest('SHA-256', diagBuf);
+    const N = 20;
+    const t0 = performance.now();
+    for (let i = 0; i < N; i++) await crypto.subtle.digest('SHA-256', diagBuf);
+    const elapsed = performance.now() - t0;
+    const mbps = (N * 1) / (elapsed / 1000); // N * 1 MiB
+    console.log(`[DIAG] Isolated SHA-256: ${mbps.toFixed(1)} MB/s (${N}x 1MiB in ${elapsed.toFixed(1)}ms)`);
+    console.log(`[DIAG] performance.now resolution test: ${performance.now() - performance.now()}`);
+    console.log(`[DIAG] crossOriginIsolated: ${crossOriginIsolated}`);
+  }
+
+  // ── Diagnostic: check if hash() detaches the buffer ──
+  {
+    const testData = new Uint8Array(1024);
+    fillDeterministic(testData);
+    const bufBefore = testData.buffer.byteLength;
+    await hash(testData);
+    const bufAfter = testData.buffer.byteLength;
+    console.log(`[DIAG] Buffer before hash(): ${bufBefore}, after: ${bufAfter}, detached: ${bufAfter === 0}`);
+  }
+
   // Pre-create all rows
   const rows = [];
   for (const size of SIZES) {
