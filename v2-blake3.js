@@ -2,6 +2,7 @@
 // No setup needed: just call hash() or hashStream().
 
 import { V2Hasher } from './v2-hasher.js';
+import { V2IncrementalHasher } from './v2-incremental.js';
 
 let hasher = null;
 let initPromise = null;
@@ -26,4 +27,13 @@ export async function hash(data) {
 export async function hashStream(stream) {
   const h = await ensureInit();
   return h.hashStream(stream);
+}
+
+export async function createHasher() {
+  const h = await ensureInit();
+  const incremental = new V2IncrementalHasher({
+    pool: h.pool, pkg: h.pkg, wasmMemory: h.wasmMemory
+  });
+  await incremental.init();
+  return incremental;
 }
