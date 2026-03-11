@@ -1,0 +1,653 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>BLAKE3 v2 — Parallel Browser Hasher</title>
+<script src="coi-serviceworker.min.js"></script>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;700&display=swap" rel="stylesheet">
+<style>
+*, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+
+body {
+  font-family: system-ui, -apple-system, sans-serif;
+  background: #1a1a2e;
+  color: #e0e0e0;
+  max-width: 960px;
+  margin: 0 auto;
+  padding: 24px 16px 48px;
+  line-height: 1.6;
+}
+
+.mono { font-family: 'JetBrains Mono', monospace; }
+
+h1 {
+  font-size: 2rem;
+  color: #00d4ff;
+  margin-bottom: 4px;
+}
+h2 {
+  font-size: 1.4rem;
+  color: #00d4ff;
+  margin-bottom: 16px;
+  padding-bottom: 8px;
+  border-bottom: 1px solid #333;
+}
+
+.subtitle {
+  color: #888;
+  font-size: 0.95rem;
+  margin-bottom: 16px;
+}
+
+section {
+  margin-top: 40px;
+}
+
+/* System info bar */
+.sys-info {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 12px 24px;
+  background: #252540;
+  border-radius: 8px;
+  padding: 12px 16px;
+  margin-top: 16px;
+  font-size: 0.85rem;
+}
+.sys-info .label { color: #888; }
+.sys-info .value { color: #e0e0e0; }
+.sys-info .value.ok { color: #4ade80; }
+.sys-info .value.warn { color: #fbbf24; }
+
+/* Buttons */
+.btn {
+  font-size: 1.1rem;
+  padding: 10px 32px;
+  cursor: pointer;
+  background: #00d4ff;
+  color: #000;
+  border: none;
+  border-radius: 6px;
+  font-weight: 700;
+  transition: opacity 0.15s;
+}
+.btn:hover { opacity: 0.85; }
+.btn:disabled { opacity: 0.4; cursor: not-allowed; }
+
+/* Bar chart */
+.bench-row {
+  margin-bottom: 20px;
+}
+.bench-row .size-label {
+  font-family: 'JetBrains Mono', monospace;
+  font-size: 0.9rem;
+  color: #aaa;
+  margin-bottom: 6px;
+}
+.bar-pair {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+.bar-wrapper {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  height: 28px;
+}
+.bar-algo-label {
+  width: 60px;
+  font-size: 0.75rem;
+  text-align: right;
+  color: #888;
+  flex-shrink: 0;
+}
+.bar-track {
+  flex: 1;
+  height: 100%;
+  background: #252540;
+  border-radius: 4px;
+  overflow: hidden;
+  position: relative;
+}
+.bar-fill {
+  height: 100%;
+  border-radius: 4px;
+  display: flex;
+  align-items: center;
+  padding: 0 10px;
+  font-family: 'JetBrains Mono', monospace;
+  font-size: 0.8rem;
+  font-weight: 700;
+  color: #000;
+  white-space: nowrap;
+  min-width: 60px;
+  transition: width 0.4s ease;
+}
+.bar-fill.blake3 { background: #00d4ff; }
+.bar-fill.sha256 { background: #ff6b6b; }
+
+.speed-badge {
+  font-family: 'JetBrains Mono', monospace;
+  font-size: 0.8rem;
+  flex-shrink: 0;
+  width: 80px;
+}
+.speed-badge.winner {
+  color: #4ade80;
+  font-weight: 700;
+}
+
+.bench-status {
+  margin: 12px 0 20px;
+  font-size: 0.9rem;
+  color: #888;
+  min-height: 1.5em;
+}
+
+/* File hasher */
+.drop-zone {
+  border: 2px dashed #444;
+  border-radius: 12px;
+  padding: 40px 20px;
+  text-align: center;
+  cursor: pointer;
+  transition: border-color 0.2s, background 0.2s;
+  margin-bottom: 20px;
+}
+.drop-zone:hover, .drop-zone.dragover {
+  border-color: #00d4ff;
+  background: #1a2a3e;
+}
+.drop-zone p { color: #888; margin-top: 8px; }
+
+.file-input { display: none; }
+
+.file-result {
+  background: #252540;
+  border-radius: 8px;
+  padding: 16px 20px;
+  margin-top: 16px;
+}
+.file-result .row {
+  display: flex;
+  justify-content: space-between;
+  align-items: baseline;
+  margin-bottom: 8px;
+  flex-wrap: wrap;
+  gap: 4px;
+}
+.file-result .row .label { color: #888; font-size: 0.85rem; }
+.file-result .row .value { font-family: 'JetBrains Mono', monospace; font-size: 0.9rem; }
+
+.progress-bar-track {
+  width: 100%;
+  height: 6px;
+  background: #333;
+  border-radius: 3px;
+  margin: 12px 0;
+  overflow: hidden;
+}
+.progress-bar-fill {
+  height: 100%;
+  background: #00d4ff;
+  border-radius: 3px;
+  transition: width 0.1s linear;
+  width: 0%;
+}
+
+.hash-output {
+  font-family: 'JetBrains Mono', monospace;
+  font-size: 0.85rem;
+  color: #00d4ff;
+  word-break: break-all;
+  padding: 8px 0;
+}
+
+.comparison-summary {
+  background: #1a3a1a;
+  border: 1px solid #4ade80;
+  border-radius: 8px;
+  padding: 16px 20px;
+  margin-top: 16px;
+  text-align: center;
+}
+.comparison-summary .big {
+  font-family: 'JetBrains Mono', monospace;
+  font-size: 1.6rem;
+  font-weight: 700;
+  color: #4ade80;
+}
+
+/* Code blocks */
+.code-block {
+  background: #0d0d1a;
+  border: 1px solid #333;
+  border-radius: 8px;
+  padding: 16px 20px;
+  margin-bottom: 16px;
+  overflow-x: auto;
+}
+.code-block pre {
+  font-family: 'JetBrains Mono', monospace;
+  font-size: 0.85rem;
+  line-height: 1.5;
+  white-space: pre;
+  color: #e0e0e0;
+}
+.code-block .comment { color: #666; }
+.code-block .keyword { color: #c792ea; }
+.code-block .fn { color: #82aaff; }
+.code-block .str { color: #c3e88d; }
+
+/* Footer */
+footer {
+  margin-top: 48px;
+  padding-top: 16px;
+  border-top: 1px solid #333;
+  text-align: center;
+  font-size: 0.85rem;
+  color: #666;
+}
+footer a { color: #00d4ff; text-decoration: none; }
+footer a:hover { text-decoration: underline; }
+
+/* Responsive */
+@media (max-width: 600px) {
+  h1 { font-size: 1.5rem; }
+  .btn { width: 100%; }
+  .sys-info { flex-direction: column; gap: 6px; }
+  .speed-badge { width: 60px; font-size: 0.7rem; }
+  .bar-algo-label { width: 48px; font-size: 0.7rem; }
+}
+</style>
+</head>
+<body>
+
+<header>
+  <h1>BLAKE3 v2 — Parallel Browser Hasher</h1>
+  <p class="subtitle">WebAssembly + Web Workers + SharedArrayBuffer + Atomics</p>
+  <div class="sys-info" id="sys-info">
+    <span><span class="label">Platform:</span> <span class="value" id="si-platform">—</span></span>
+    <span><span class="label">Cores:</span> <span class="value" id="si-cores">—</span></span>
+    <span><span class="label">Cross-Origin Isolated:</span> <span class="value" id="si-coi">—</span></span>
+    <span><span class="label">Browser:</span> <span class="value" id="si-browser">—</span></span>
+  </div>
+</header>
+
+<!-- Section 1: Synthetic Benchmark -->
+<section>
+  <h2>Synthetic Benchmark</h2>
+  <button class="btn" id="bench-btn" onclick="window._runBenchmark()">Run Benchmark</button>
+  <div class="bench-status" id="bench-status"></div>
+  <div id="bench-results"></div>
+</section>
+
+<!-- Section 2: File Hasher -->
+<section>
+  <h2>File Hasher</h2>
+  <div class="drop-zone" id="drop-zone" onclick="document.getElementById('file-input').click()">
+    <span style="font-size:2rem">📂</span>
+    <p>Drag &amp; drop a file here, or click to select</p>
+  </div>
+  <input type="file" class="file-input" id="file-input">
+  <div id="file-output"></div>
+</section>
+
+<!-- Section 3: API Preview -->
+<section>
+  <h2>API Preview</h2>
+
+  <div class="code-block"><pre><span class="comment">// Convenient — hash data in one call</span>
+<span class="keyword">import</span> { <span class="fn">hash</span> } <span class="keyword">from</span> <span class="str">'./v2-blake3.js'</span>;
+
+<span class="keyword">const</span> digest = <span class="keyword">await</span> <span class="fn">hash</span>(data);          <span class="comment">// Uint8Array(32)</span></pre></div>
+
+  <div class="code-block"><pre><span class="comment">// Stream — hash a ReadableStream</span>
+<span class="keyword">import</span> { <span class="fn">hashStream</span> } <span class="keyword">from</span> <span class="str">'./v2-blake3.js'</span>;
+
+<span class="keyword">const</span> digest = <span class="keyword">await</span> <span class="fn">hashStream</span>(file.stream());</pre></div>
+
+  <div class="code-block"><pre><span class="comment">// Incremental — update in chunks, then finalize</span>
+<span class="keyword">import</span> { <span class="fn">createHasher</span> } <span class="keyword">from</span> <span class="str">'./v2-blake3.js'</span>;
+
+<span class="keyword">const</span> h = <span class="keyword">await</span> <span class="fn">createHasher</span>();
+<span class="keyword">await</span> h.<span class="fn">update</span>(chunk1);
+<span class="keyword">await</span> h.<span class="fn">update</span>(chunk2);
+<span class="keyword">const</span> digest = <span class="keyword">await</span> h.<span class="fn">finalize</span>();        <span class="comment">// Uint8Array(32)</span></pre></div>
+</section>
+
+<footer>
+  <p><a href="https://github.com/nicholasburba/blake3-benchmark">GitHub Repository</a></p>
+  <p>BLAKE3 — <a href="https://github.com/BLAKE3-team/BLAKE3">blake3-team/BLAKE3</a></p>
+</footer>
+
+<script type="module">
+import { hash, createHasher } from './v2-blake3.js';
+
+// ── Helpers ──────────────────────────────────────────────
+
+function hex(bytes) {
+  return Array.from(bytes).map(b => b.toString(16).padStart(2, '0')).join('');
+}
+
+function fillDeterministic(buf) {
+  for (let i = 0; i < buf.length; i++) buf[i] = i & 0xFF;
+}
+
+function formatSize(bytes) {
+  if (bytes >= 1024 * 1024 * 1024) return (bytes / (1024 ** 3)).toFixed(1) + ' GiB';
+  if (bytes >= 1024 * 1024) return (bytes / (1024 ** 2)).toFixed(0) + ' MiB';
+  if (bytes >= 1024) return (bytes / 1024).toFixed(0) + ' KiB';
+  return bytes + ' B';
+}
+
+function formatSpeed(mbps) {
+  return mbps >= 1000 ? (mbps / 1000).toFixed(2) + ' GB/s' : mbps.toFixed(1) + ' MB/s';
+}
+
+// ── System Info ──────────────────────────────────────────
+
+function detectBrowser() {
+  const ua = navigator.userAgent;
+  if (ua.includes('Firefox/')) return 'Firefox ' + ua.split('Firefox/')[1].split(' ')[0];
+  if (ua.includes('Edg/')) return 'Edge ' + ua.split('Edg/')[1].split(' ')[0];
+  if (ua.includes('Chrome/')) return 'Chrome ' + ua.split('Chrome/')[1].split(' ')[0];
+  if (ua.includes('Safari/') && !ua.includes('Chrome')) return 'Safari';
+  return 'Unknown';
+}
+
+document.getElementById('si-platform').textContent = navigator.platform || 'Unknown';
+document.getElementById('si-cores').textContent = navigator.hardwareConcurrency || '?';
+
+const coiEl = document.getElementById('si-coi');
+const isCOI = crossOriginIsolated;
+coiEl.textContent = isCOI ? 'Yes' : 'No';
+coiEl.className = 'value ' + (isCOI ? 'ok' : 'warn');
+
+document.getElementById('si-browser').textContent = detectBrowser();
+
+// ── Synthetic Benchmark ──────────────────────────────────
+
+const SIZES = [
+  64 * 1024,         // 64 KiB
+  256 * 1024,        // 256 KiB
+  1024 * 1024,       // 1 MiB
+  4 * 1024 * 1024,   // 4 MiB
+  16 * 1024 * 1024,  // 16 MiB
+  64 * 1024 * 1024,  // 64 MiB
+  256 * 1024 * 1024, // 256 MiB
+];
+
+function createBenchRow(sizeLabel) {
+  const row = document.createElement('div');
+  row.className = 'bench-row';
+  row.innerHTML = `
+    <div class="size-label">${sizeLabel}</div>
+    <div class="bar-pair">
+      <div class="bar-wrapper">
+        <span class="bar-algo-label">BLAKE3</span>
+        <div class="bar-track"><div class="bar-fill blake3" style="width:0%"></div></div>
+        <span class="speed-badge mono" data-algo="blake3">—</span>
+      </div>
+      <div class="bar-wrapper">
+        <span class="bar-algo-label">SHA-256</span>
+        <div class="bar-track"><div class="bar-fill sha256" style="width:0%"></div></div>
+        <span class="speed-badge mono" data-algo="sha256">—</span>
+      </div>
+    </div>`;
+  return row;
+}
+
+async function benchmarkSize(data, warmup, iterations) {
+  // Warmup
+  for (let i = 0; i < warmup; i++) {
+    await hash(data);
+    await crypto.subtle.digest('SHA-256', data);
+  }
+
+  // BLAKE3
+  const b3Start = performance.now();
+  for (let i = 0; i < iterations; i++) await hash(data);
+  const b3Ms = (performance.now() - b3Start) / iterations;
+
+  // SHA-256
+  const shaStart = performance.now();
+  for (let i = 0; i < iterations; i++) await crypto.subtle.digest('SHA-256', data);
+  const shaMs = (performance.now() - shaStart) / iterations;
+
+  const sizeMB = data.byteLength / (1024 * 1024);
+  return {
+    blake3MBps: sizeMB / (b3Ms / 1000),
+    sha256MBps: sizeMB / (shaMs / 1000),
+  };
+}
+
+async function runSyntheticBenchmark() {
+  const btn = document.getElementById('bench-btn');
+  const status = document.getElementById('bench-status');
+  const results = document.getElementById('bench-results');
+  btn.disabled = true;
+  results.innerHTML = '';
+
+  // Pre-create all rows
+  const rows = [];
+  for (const size of SIZES) {
+    const row = createBenchRow(formatSize(size));
+    results.appendChild(row);
+    rows.push(row);
+  }
+
+  let overallMax = 0;
+
+  for (let i = 0; i < SIZES.length; i++) {
+    const size = SIZES[i];
+    const iterations = size <= 1024 * 1024 ? 10 : 3;
+    status.textContent = `Benchmarking ${formatSize(size)} (${iterations} iterations)…`;
+
+    // Generate data
+    const data = new Uint8Array(size);
+    fillDeterministic(data);
+
+    const { blake3MBps, sha256MBps } = await benchmarkSize(data, 1, iterations);
+    const maxMBps = Math.max(blake3MBps, sha256MBps, overallMax);
+    overallMax = maxMBps;
+
+    // Update all bars with new scale
+    updateRow(rows[i], blake3MBps, sha256MBps, maxMBps);
+
+    // Re-scale previous rows
+    for (let j = 0; j < i; j++) {
+      const prev = rows[j];
+      const b3 = parseFloat(prev.dataset.blake3 || 0);
+      const sha = parseFloat(prev.dataset.sha256 || 0);
+      rescaleRow(prev, b3, sha, overallMax);
+    }
+  }
+
+  status.textContent = 'Benchmark complete.';
+  btn.disabled = false;
+}
+
+function updateRow(row, blake3MBps, sha256MBps, maxMBps) {
+  row.dataset.blake3 = blake3MBps;
+  row.dataset.sha256 = sha256MBps;
+
+  const b3Bar = row.querySelector('.bar-fill.blake3');
+  const shaBar = row.querySelector('.bar-fill.sha256');
+  const b3Badge = row.querySelector('[data-algo="blake3"]');
+  const shaBadge = row.querySelector('[data-algo="sha256"]');
+
+  const b3Pct = Math.max((blake3MBps / maxMBps) * 100, 2);
+  const shaPct = Math.max((sha256MBps / maxMBps) * 100, 2);
+
+  b3Bar.style.width = b3Pct + '%';
+  b3Bar.textContent = formatSpeed(blake3MBps);
+  shaBar.style.width = shaPct + '%';
+  shaBar.textContent = formatSpeed(sha256MBps);
+
+  if (blake3MBps > sha256MBps) {
+    const ratio = (blake3MBps / sha256MBps).toFixed(1);
+    b3Badge.textContent = ratio + 'x faster';
+    b3Badge.className = 'speed-badge mono winner';
+    shaBadge.textContent = '';
+    shaBadge.className = 'speed-badge mono';
+  } else if (sha256MBps > blake3MBps) {
+    const ratio = (sha256MBps / blake3MBps).toFixed(1);
+    shaBadge.textContent = ratio + 'x faster';
+    shaBadge.className = 'speed-badge mono';
+    shaBadge.style.color = '#ff6b6b';
+    b3Badge.textContent = '';
+    b3Badge.className = 'speed-badge mono';
+  } else {
+    b3Badge.textContent = 'tie';
+    shaBadge.textContent = 'tie';
+  }
+}
+
+function rescaleRow(row, blake3MBps, sha256MBps, maxMBps) {
+  const b3Bar = row.querySelector('.bar-fill.blake3');
+  const shaBar = row.querySelector('.bar-fill.sha256');
+  b3Bar.style.width = Math.max((blake3MBps / maxMBps) * 100, 2) + '%';
+  shaBar.style.width = Math.max((sha256MBps / maxMBps) * 100, 2) + '%';
+}
+
+window._runBenchmark = runSyntheticBenchmark;
+
+// ── File Hasher ──────────────────────────────────────────
+
+const dropZone = document.getElementById('drop-zone');
+const fileInput = document.getElementById('file-input');
+const fileOutput = document.getElementById('file-output');
+
+dropZone.addEventListener('dragover', e => { e.preventDefault(); dropZone.classList.add('dragover'); });
+dropZone.addEventListener('dragleave', () => dropZone.classList.remove('dragover'));
+dropZone.addEventListener('drop', e => {
+  e.preventDefault();
+  dropZone.classList.remove('dragover');
+  if (e.dataTransfer.files.length) hashFile(e.dataTransfer.files[0]);
+});
+fileInput.addEventListener('change', () => {
+  if (fileInput.files.length) hashFile(fileInput.files[0]);
+});
+
+async function hashFile(file) {
+  fileOutput.innerHTML = `
+    <div class="file-result" id="fr">
+      <div class="row"><span class="label">File</span><span class="value">${file.name}</span></div>
+      <div class="row"><span class="label">Size</span><span class="value mono">${formatSize(file.size)}</span></div>
+      <div class="progress-bar-track"><div class="progress-bar-fill" id="prog-fill"></div></div>
+      <div class="row">
+        <span class="label" id="hash-status">Hashing with BLAKE3…</span>
+        <span class="value mono" id="live-speed">—</span>
+      </div>
+      <div class="hash-output" id="blake3-hash" style="display:none"></div>
+      <div class="hash-output" id="sha256-hash" style="display:none"></div>
+    </div>`;
+
+  const progFill = document.getElementById('prog-fill');
+  const liveSpeed = document.getElementById('live-speed');
+  const hashStatus = document.getElementById('hash-status');
+  const blake3HashEl = document.getElementById('blake3-hash');
+  const sha256HashEl = document.getElementById('sha256-hash');
+
+  // BLAKE3 with incremental API + progress
+  let bytesProcessed = 0;
+  const b3Start = performance.now();
+
+  const speedInterval = setInterval(() => {
+    const elapsed = (performance.now() - b3Start) / 1000;
+    if (elapsed > 0 && bytesProcessed > 0) {
+      const mbps = (bytesProcessed / (1024 * 1024)) / elapsed;
+      liveSpeed.textContent = formatSpeed(mbps);
+    }
+    if (file.size > 0) {
+      progFill.style.width = ((bytesProcessed / file.size) * 100).toFixed(1) + '%';
+    }
+  }, 100);
+
+  const hasher = await createHasher();
+  const reader = file.stream().getReader();
+
+  while (true) {
+    const { done, value } = await reader.read();
+    if (done) break;
+    await hasher.update(value);
+    bytesProcessed += value.byteLength;
+  }
+
+  const b3Digest = await hasher.finalize();
+  const b3Ms = performance.now() - b3Start;
+  clearInterval(speedInterval);
+
+  progFill.style.width = '100%';
+  const b3Hex = hex(b3Digest);
+  const b3MBps = (file.size / (1024 * 1024)) / (b3Ms / 1000);
+  blake3HashEl.style.display = 'block';
+  blake3HashEl.innerHTML = `<span style="color:#888">BLAKE3:</span> ${b3Hex}`;
+
+  hasher.destroy();
+
+  // SHA-256
+  hashStatus.textContent = 'Hashing with SHA-256…';
+  progFill.style.width = '0%';
+  progFill.style.background = '#ff6b6b';
+  liveSpeed.textContent = '—';
+
+  let shaBytesProcessed = 0;
+  const shaStart = performance.now();
+
+  // SHA-256 doesn't have streaming in subtle — read whole file into buffer
+  // For large files, read chunks into an ArrayBuffer
+  const shaSpeedInterval = setInterval(() => {
+    const elapsed = (performance.now() - shaStart) / 1000;
+    if (elapsed > 0) {
+      liveSpeed.textContent = 'reading…';
+    }
+  }, 100);
+
+  const fileBuffer = await file.arrayBuffer();
+  clearInterval(shaSpeedInterval);
+
+  const shaDigestStart = performance.now();
+  const shaDigest = await crypto.subtle.digest('SHA-256', fileBuffer);
+  const shaMs = performance.now() - shaStart;
+  const shaHex = hex(new Uint8Array(shaDigest));
+  const shaMBps = (file.size / (1024 * 1024)) / (shaMs / 1000);
+
+  progFill.style.width = '100%';
+  sha256HashEl.style.display = 'block';
+  sha256HashEl.innerHTML = `<span style="color:#888">SHA-256:</span> ${shaHex}`;
+
+  hashStatus.textContent = 'Complete';
+  liveSpeed.textContent = '';
+
+  // Comparison summary
+  if (file.size > 0) {
+    const ratio = (b3MBps > shaMBps)
+      ? (b3MBps / shaMBps).toFixed(1)
+      : (shaMBps / b3MBps).toFixed(1);
+    const winner = b3MBps > shaMBps ? 'BLAKE3' : 'SHA-256';
+    const winColor = b3MBps > shaMBps ? '#4ade80' : '#ff6b6b';
+
+    const summary = document.createElement('div');
+    summary.className = 'comparison-summary';
+    if (b3MBps <= shaMBps) {
+      summary.style.background = '#3a1a1a';
+      summary.style.borderColor = '#ff6b6b';
+    }
+    summary.innerHTML = `
+      <div style="display:flex;justify-content:center;gap:40px;flex-wrap:wrap;margin-bottom:12px">
+        <div><span style="color:#888">BLAKE3</span><br><span class="mono" style="color:#00d4ff;font-size:1.1rem">${formatSpeed(b3MBps)}</span></div>
+        <div><span style="color:#888">SHA-256</span><br><span class="mono" style="color:#ff6b6b;font-size:1.1rem">${formatSpeed(shaMBps)}</span></div>
+      </div>
+      <div class="big" style="color:${winColor}">${winner} wins — ${ratio}x faster</div>`;
+    fileOutput.appendChild(summary);
+  }
+}
+</script>
+</body>
+</html>
