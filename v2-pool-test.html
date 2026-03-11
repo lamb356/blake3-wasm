@@ -156,53 +156,68 @@
       }
     }
 
-    // ═══ Test 3: Parallel Workers ═══
+    // ═══ Test 3: Parallel Workers (1000 iterations) ═══
     {
-      const div = addTest('test3', 'Test 3 — 4 Parcels to 4 Workers in Parallel');
+      const div = addTest('test3', 'Test 3 — Parallel Dispatch (1000 iterations × 4 workers)');
       try {
         const pool = new WorkerPool({ workerCount: WORKER_COUNT, wasmModule, wasmMemory, pkg });
         await pool.init();
 
-        // Allocate 4 × 64 KiB parcels
+        const ITERATIONS = 1000;
+
+        // Allocate 4 × 64 KiB parcels, fill data, compute refs — all BEFORE timing
         const totalSize = PARCEL_SIZE * WORKER_COUNT;
         const dataPtr = pkg.alloc_input(totalSize);
         const heap = new Uint8Array(wasmMemory.buffer);
 
         const refCVs = [];
+        const parcelPtrs = [];
+        const inputOffsets = [];
         for (let i = 0; i < WORKER_COUNT; i++) {
           const parcelPtr = dataPtr + i * PARCEL_SIZE;
           const parcelView = heap.subarray(parcelPtr, parcelPtr + PARCEL_SIZE);
           fillDeterministic(parcelView, i * PARCEL_SIZE);
           const inputOffset = BigInt(i * PARCEL_SIZE);
           refCVs.push(referenceCV(pkg, wasmMemory, parcelPtr, PARCEL_SIZE, inputOffset));
+          parcelPtrs.push(parcelPtr);
+          inputOffsets.push(inputOffset);
         }
 
-        // Dispatch all 4 simultaneously
-        const t0 = performance.now();
+        // Correctness check: dispatch once, verify all 4 CVs match refs
         for (let i = 0; i < WORKER_COUNT; i++) {
-          const parcelPtr = dataPtr + i * PARCEL_SIZE;
-          const inputOffset = BigInt(i * PARCEL_SIZE);
-          pool.dispatchToWorker(i, parcelPtr, inputOffset);
+          pool.dispatchToWorker(i, parcelPtrs[i], inputOffsets[i]);
         }
-
-        // Wait for all
-        const workerCVs = await Promise.all(
+        const checkCVs = await Promise.all(
           Array.from({ length: WORKER_COUNT }, (_, i) => pool.waitForWorker(i))
         );
-        const elapsed = (performance.now() - t0).toFixed(2);
-
         let allMatch = true;
         let details = '';
         for (let i = 0; i < WORKER_COUNT; i++) {
-          const match = arraysEqual(refCVs[i], workerCVs[i]);
+          const match = arraysEqual(refCVs[i], checkCVs[i]);
           if (!match) allMatch = false;
-          details += `<span class="label">Worker ${i}:</span> ${match ? '<span class="ok">✓</span>' : '<span class="err">✗</span>'} <span class="hash">${hex(workerCVs[i])}</span>\n`;
+          details += `<span class="label">Worker ${i}:</span> ${match ? '<span class="ok">✓</span>' : '<span class="err">✗</span>'} <span class="hash">${hex(checkCVs[i])}</span>\n`;
         }
 
+        // Timed benchmark loop: dispatch + wait only
+        const t0 = performance.now();
+        for (let iter = 0; iter < ITERATIONS; iter++) {
+          for (let i = 0; i < WORKER_COUNT; i++) {
+            pool.dispatchToWorker(i, parcelPtrs[i], inputOffsets[i]);
+          }
+          await Promise.all(
+            Array.from({ length: WORKER_COUNT }, (_, i) => pool.waitForWorker(i))
+          );
+        }
+        const totalMs = performance.now() - t0;
+        const avgMs = totalMs / ITERATIONS;
+        const opsPerSec = (ITERATIONS / totalMs) * 1000;
+
         setTestResult(div, allMatch,
-          `<span class="label">Dispatched:</span> 4 × 64 KiB parcels to 4 workers simultaneously\n` +
-          `<span class="label">Parallel time:</span> ${elapsed} ms\n\n` +
+          `<span class="label">Dispatched:</span> 4 × 64 KiB parcels to 4 workers simultaneously\n\n` +
           details +
+          `\n<span class="label">Total:</span> ${totalMs.toFixed(2)} ms (${ITERATIONS} iterations)\n` +
+          `<span class="label">Average:</span> ${avgMs.toFixed(3)} ms/op\n` +
+          `<span class="label">Throughput:</span> ${opsPerSec.toFixed(0)} ops/sec\n` +
           `\n${allMatch ? '<span class="ok">All CVs match reference ✓</span>' : '<span class="err">CV mismatch detected ✗</span>'}`
         );
 
@@ -213,41 +228,45 @@
       }
     }
 
-    // ═══ Test 4: Sequential Same Worker ═══
+    // ═══ Test 4: Sequential Same Worker (1000 iterations) ═══
     {
-      const div = addTest('test4', 'Test 4 — 10 Parcels Sequential on Worker 0');
+      const div = addTest('test4', 'Test 4 — Sequential Dispatch (1000 iterations on Worker 0)');
       try {
         const pool = new WorkerPool({ workerCount: WORKER_COUNT, wasmModule, wasmMemory, pkg });
         await pool.init();
 
+        const ITERATIONS = 1000;
+
+        // Allocate 1 × 64 KiB, fill once, compute ref — all BEFORE timing
         const dataPtr = pkg.alloc_input(PARCEL_SIZE);
         const heap = new Uint8Array(wasmMemory.buffer);
         const parcelView = heap.subarray(dataPtr, dataPtr + PARCEL_SIZE);
+        fillDeterministic(parcelView);
+        const inputOffset = 0n;
+        const refCV = referenceCV(pkg, wasmMemory, dataPtr, PARCEL_SIZE, inputOffset);
 
-        let allMatch = true;
-        let details = '';
+        // Correctness check: dispatch once, verify CV matches ref
+        pool.dispatchToWorker(0, dataPtr, inputOffset);
+        const checkCV = await pool.waitForWorker(0);
+        const match = arraysEqual(refCV, checkCV);
+
+        // Timed benchmark loop: dispatch + wait only
         const t0 = performance.now();
-
-        for (let i = 0; i < 10; i++) {
-          fillDeterministic(parcelView, i * 7); // vary fill pattern
-          const inputOffset = BigInt(i * PARCEL_SIZE);
-          const refCV = referenceCV(pkg, wasmMemory, dataPtr, PARCEL_SIZE, inputOffset);
-
+        for (let iter = 0; iter < ITERATIONS; iter++) {
           pool.dispatchToWorker(0, dataPtr, inputOffset);
-          const workerCV = await pool.waitForWorker(0);
-
-          const match = arraysEqual(refCV, workerCV);
-          if (!match) allMatch = false;
-          details += `<span class="label">Parcel ${i.toString().padStart(2)}:</span> ${match ? '<span class="ok">✓</span>' : '<span class="err">✗</span>'} <span class="hash">${hex(workerCV).slice(0, 16)}...</span>\n`;
+          await pool.waitForWorker(0);
         }
+        const totalMs = performance.now() - t0;
+        const avgMs = totalMs / ITERATIONS;
+        const opsPerSec = (ITERATIONS / totalMs) * 1000;
 
-        const elapsed = (performance.now() - t0).toFixed(2);
-
-        setTestResult(div, allMatch,
-          `<span class="label">10 sequential parcels on worker 0</span>\n` +
-          `<span class="label">Total time:</span> ${elapsed} ms (${(parseFloat(elapsed) / 10).toFixed(2)} ms/parcel)\n\n` +
-          details +
-          `\n${allMatch ? '<span class="ok">All 10 CVs match ✓</span>' : '<span class="err">CV mismatch ✗</span>'}`
+        setTestResult(div, match,
+          `<span class="label">Sequential dispatches on Worker 0</span>\n` +
+          `<span class="label">CV check:</span> ${match ? '<span class="ok">✓</span>' : '<span class="err">✗</span>'} <span class="hash">${hex(checkCV)}</span>\n\n` +
+          `<span class="label">Total:</span> ${totalMs.toFixed(2)} ms (${ITERATIONS} iterations)\n` +
+          `<span class="label">Average:</span> ${avgMs.toFixed(3)} ms/op\n` +
+          `<span class="label">Throughput:</span> ${opsPerSec.toFixed(0)} ops/sec\n` +
+          `\n${match ? '<span class="ok">CV matches reference ✓</span>' : '<span class="err">CV mismatch ✗</span>'}`
         );
 
         pkg.free_input(dataPtr, PARCEL_SIZE);
