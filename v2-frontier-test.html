@@ -1,0 +1,381 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <title>V2 Frontier Test</title>
+  <script src="coi-serviceworker.min.js"></script>
+  <style>
+    body { font-family: monospace; max-width: 900px; margin: 2em auto; background: #1a1a2e; color: #e0e0e0; }
+    h1 { color: #00d4ff; }
+    .test { border: 1px solid #333; border-radius: 6px; padding: 1em; margin: 1em 0; }
+    .test h2 { margin-top: 0; }
+    .pass { border-color: #0f0; background: #0f01; }
+    .fail { border-color: #f00; background: #f001; }
+    .running { border-color: #ff0; background: #ff01; }
+    .label { color: #888; }
+    .hash { color: #0ff; word-break: break-all; }
+    .ok { color: #0f0; font-weight: bold; }
+    .err { color: #f00; font-weight: bold; }
+    pre { white-space: pre-wrap; }
+    #run-btn { font-size: 1.2em; padding: 0.5em 2em; cursor: pointer; background: #00d4ff; color: #000; border: none; border-radius: 4px; }
+    #run-btn:disabled { opacity: 0.5; cursor: not-allowed; }
+  </style>
+</head>
+<body>
+  <h1>V2 Frontier Tests</h1>
+  <p>Tests the Merkle frontier (48-entry CV stack) that merges subtree CVs into the final BLAKE3 hash.</p>
+  <button id="run-btn" onclick="runAllTests()">Run Tests</button>
+  <div id="results"></div>
+
+<script type="module">
+  import { V2Frontier } from './v2-frontier.js';
+  import { WorkerPool } from './v2-pool.js';
+  import { V2Coordinator } from './v2-coordinator.js';
+
+  window.runAllTests = runAllTests;
+
+  const resultsEl = document.getElementById('results');
+  const runBtn = document.getElementById('run-btn');
+  const PARCEL_SIZE = 65536; // 64 KiB
+  const CHUNK_SIZE = 1024;   // 1 KiB
+
+  function hex(bytes) {
+    return Array.from(bytes).map(b => b.toString(16).padStart(2, '0')).join('');
+  }
+
+  function arraysEqual(a, b) {
+    if (a.length !== b.length) return false;
+    for (let i = 0; i < a.length; i++) { if (a[i] !== b[i]) return false; }
+    return true;
+  }
+
+  function addTest(id, title) {
+    const div = document.createElement('div');
+    div.className = 'test running';
+    div.id = id;
+    div.innerHTML = `<h2>${title}</h2><pre class="log">Running...</pre>`;
+    resultsEl.appendChild(div);
+    return div;
+  }
+
+  function setTestResult(div, pass, html) {
+    div.className = pass ? 'test pass' : 'test fail';
+    div.querySelector('.log').innerHTML = html;
+  }
+
+  function fillDeterministic(buf, offset = 0) {
+    for (let i = 0; i < buf.length; i++) {
+      buf[i] = (i + offset) & 0xFF;
+    }
+  }
+
+  /** Compute reference hash via hash_ptr (ground truth with root finalization) */
+  function computeRefHash(pkg, wasmMemory, data) {
+    const ptr = pkg.alloc_input(data.length);
+    const heap = new Uint8Array(wasmMemory.buffer);
+    heap.set(data, ptr);
+    const hash = pkg.hash_ptr(ptr, data.length);
+    pkg.free_input(ptr, data.length);
+    return hash;
+  }
+
+  /** Compute non-root subtree CV via hash_subtree_ptr */
+  function computeSubtreeCV(pkg, wasmMemory, data, inputOffset) {
+    const ptr = pkg.alloc_input(data.length);
+    const heap = new Uint8Array(wasmMemory.buffer);
+    heap.set(data, ptr);
+    const cv = pkg.hash_subtree_ptr(ptr, data.length, BigInt(inputOffset));
+    pkg.free_input(ptr, data.length);
+    return cv;
+  }
+
+  /** Create a ReadableStream from data, yielding chunks of chunkSize */
+  function makeStream(data, chunkSize = data.length) {
+    let pos = 0;
+    return new ReadableStream({
+      pull(controller) {
+        if (pos >= data.length) {
+          controller.close();
+          return;
+        }
+        const end = Math.min(pos + chunkSize, data.length);
+        controller.enqueue(data.slice(pos, end));
+        pos = end;
+      }
+    });
+  }
+
+  /** Create a V2Frontier wired to the WASM pkg */
+  function makeFrontier(pkg) {
+    return new V2Frontier({
+      parentCvFn: (l, r) => pkg.parent_cv(l, r),
+      rootHashFn: (l, r) => pkg.root_hash(l, r),
+      hashPtrFn:  (ptr, size) => pkg.hash_ptr(ptr, size),
+    });
+  }
+
+  async function runAllTests() {
+    runBtn.disabled = true;
+    resultsEl.innerHTML = '';
+
+    let pkg, wasmInstance, wasmModule, wasmMemory;
+
+    // Load WASM
+    try {
+      pkg = await import('./blake3-wasm-shared/pkg/blake3_wasm_shared.js');
+      wasmInstance = await pkg.default();
+      wasmMemory = wasmInstance.memory;
+
+      const wasmUrl = new URL('./blake3-wasm-shared/pkg/blake3_wasm_shared_bg.wasm', import.meta.url);
+      const wasmBytes = await fetch(wasmUrl).then(r => r.arrayBuffer());
+      wasmModule = await WebAssembly.compile(wasmBytes);
+    } catch (e) {
+      resultsEl.innerHTML = `<div class="test fail"><h2>Module Load Failed</h2><pre class="log"><span class="err">${e.message}</span>\n${e.stack}</pre></div>`;
+      runBtn.disabled = false;
+      return;
+    }
+
+    // ═══ Test 1: Single 64 KiB parcel ═══
+    {
+      const div = addTest('test1', 'Test 1 — Single 64 KiB parcel (finalize with data ptr)');
+      try {
+        const data = new Uint8Array(PARCEL_SIZE);
+        fillDeterministic(data);
+
+        // Reference: hash_ptr on full data
+        const refHash = computeRefHash(pkg, wasmMemory, data);
+
+        // Compute non-root subtree CV
+        const cv = computeSubtreeCV(pkg, wasmMemory, data, 0);
+
+        // Allocate data in WASM for single-entry finalize
+        const dataPtr = pkg.alloc_input(data.length);
+        new Uint8Array(wasmMemory.buffer).set(data, dataPtr);
+
+        const frontier = makeFrontier(pkg);
+        frontier.pushSubtreeCV(cv, PARCEL_SIZE / CHUNK_SIZE); // subtreeSize = 64
+        const result = frontier.finalize({ ptr: dataPtr, size: data.length });
+
+        pkg.free_input(dataPtr, data.length);
+
+        const pass = result !== null && arraysEqual(result, refHash);
+        setTestResult(div, pass,
+          `<span class="label">Input:</span> 64 KiB (1 parcel, single-entry finalize)\n` +
+          `<span class="label">Frontier:</span> <span class="hash">${hex(result)}</span>\n` +
+          `<span class="label">Ref hash:</span> <span class="hash">${hex(refHash)}</span>\n` +
+          `<span class="label">Match:</span> ${pass ? '<span class="ok">YES</span>' : '<span class="err">NO</span>'}\n` +
+          (pass ? '<span class="ok">PASS</span>' : '<span class="err">FAIL</span>')
+        );
+      } catch (e) {
+        setTestResult(div, false, `<span class="err">Error:</span> ${e.message}\n${e.stack}`);
+      }
+    }
+
+    // ═══ Test 2: Two 64 KiB parcels (128 KiB) ═══
+    {
+      const div = addTest('test2', 'Test 2 — Two 64 KiB parcels (128 KiB, immediate merge)');
+      try {
+        const totalBytes = 2 * PARCEL_SIZE;
+        const data = new Uint8Array(totalBytes);
+        fillDeterministic(data);
+
+        const refHash = computeRefHash(pkg, wasmMemory, data);
+
+        const cv0 = computeSubtreeCV(pkg, wasmMemory, data.slice(0, PARCEL_SIZE), 0);
+        const cv1 = computeSubtreeCV(pkg, wasmMemory, data.slice(PARCEL_SIZE), PARCEL_SIZE);
+
+        const frontier = makeFrontier(pkg);
+        frontier.pushSubtreeCV(cv0, 64);
+        frontier.pushSubtreeCV(cv1, 64); // merges eagerly with cv0 → 1 entry
+
+        // Power-of-2: eager merge leaves 1 entry, needs hash_ptr for root finalization
+        const stackLen = frontier.stack.length;
+        const dataPtr = pkg.alloc_input(totalBytes);
+        new Uint8Array(wasmMemory.buffer).set(data, dataPtr);
+        const result = frontier.finalize({ ptr: dataPtr, size: totalBytes });
+        pkg.free_input(dataPtr, totalBytes);
+
+        const pass = result !== null && arraysEqual(result, refHash);
+        setTestResult(div, pass,
+          `<span class="label">Input:</span> 128 KiB (2 parcels)\n` +
+          `<span class="label">Stack before finalize:</span> ${stackLen} entry (merged eagerly)\n` +
+          `<span class="label">Frontier:</span> <span class="hash">${hex(result)}</span>\n` +
+          `<span class="label">Ref hash:</span> <span class="hash">${hex(refHash)}</span>\n` +
+          `<span class="label">Match:</span> ${pass ? '<span class="ok">YES</span>' : '<span class="err">NO</span>'}\n` +
+          (pass ? '<span class="ok">PASS</span>' : '<span class="err">FAIL</span>')
+        );
+      } catch (e) {
+        setTestResult(div, false, `<span class="err">Error:</span> ${e.message}\n${e.stack}`);
+      }
+    }
+
+    // ═══ Test 3: Three 64 KiB parcels (192 KiB) ═══
+    {
+      const div = addTest('test3', 'Test 3 — Three 64 KiB parcels (192 KiB, partial merge)');
+      try {
+        const totalBytes = 3 * PARCEL_SIZE;
+        const data = new Uint8Array(totalBytes);
+        fillDeterministic(data);
+
+        const refHash = computeRefHash(pkg, wasmMemory, data);
+
+        const frontier = makeFrontier(pkg);
+        for (let i = 0; i < 3; i++) {
+          const off = i * PARCEL_SIZE;
+          const cv = computeSubtreeCV(pkg, wasmMemory, data.slice(off, off + PARCEL_SIZE), off);
+          frontier.pushSubtreeCV(cv, 64);
+        }
+
+        // After 3 pushes: first 2 merged (subtreeSize=128), third stays (subtreeSize=64) → 2 entries
+        const stackLen = frontier.stack.length;
+        const result = frontier.finalize();
+
+        const pass = result !== null && arraysEqual(result, refHash);
+        setTestResult(div, pass,
+          `<span class="label">Input:</span> 192 KiB (3 parcels)\n` +
+          `<span class="label">Stack before finalize:</span> ${stackLen} entries (expected 2)\n` +
+          `<span class="label">Frontier:</span> <span class="hash">${hex(result)}</span>\n` +
+          `<span class="label">Ref hash:</span> <span class="hash">${hex(refHash)}</span>\n` +
+          `<span class="label">Match:</span> ${pass ? '<span class="ok">YES</span>' : '<span class="err">NO</span>'}\n` +
+          (pass ? '<span class="ok">PASS</span>' : '<span class="err">FAIL</span>')
+        );
+      } catch (e) {
+        setTestResult(div, false, `<span class="err">Error:</span> ${e.message}\n${e.stack}`);
+      }
+    }
+
+    // ═══ Test 4: 16 parcels (1 MiB) — full binary merge ═══
+    {
+      const div = addTest('test4', 'Test 4 — 16 parcels (1 MiB, full binary merge tree)');
+      try {
+        const totalBytes = 16 * PARCEL_SIZE; // 1 MiB
+        const data = new Uint8Array(totalBytes);
+        fillDeterministic(data);
+
+        const refHash = computeRefHash(pkg, wasmMemory, data);
+
+        const frontier = makeFrontier(pkg);
+        for (let i = 0; i < 16; i++) {
+          const off = i * PARCEL_SIZE;
+          const cv = computeSubtreeCV(pkg, wasmMemory, data.slice(off, off + PARCEL_SIZE), off);
+          frontier.pushSubtreeCV(cv, 64);
+        }
+
+        // 16 = 2^4, so all merge eagerly into 1 entry (subtreeSize = 64*16 = 1024)
+        // Single-entry needs hash_ptr for root finalization
+        const stackLen = frontier.stack.length;
+        const dataPtr = pkg.alloc_input(totalBytes);
+        new Uint8Array(wasmMemory.buffer).set(data, dataPtr);
+        const result = frontier.finalize({ ptr: dataPtr, size: totalBytes });
+        pkg.free_input(dataPtr, totalBytes);
+
+        const pass = result !== null && arraysEqual(result, refHash);
+        setTestResult(div, pass,
+          `<span class="label">Input:</span> 1 MiB (16 parcels, power-of-2)\n` +
+          `<span class="label">Stack before finalize:</span> ${stackLen} entry (expected 1 — full eager merge)\n` +
+          `<span class="label">Frontier:</span> <span class="hash">${hex(result)}</span>\n` +
+          `<span class="label">Ref hash:</span> <span class="hash">${hex(refHash)}</span>\n` +
+          `<span class="label">Match:</span> ${pass ? '<span class="ok">YES</span>' : '<span class="err">NO</span>'}\n` +
+          (pass ? '<span class="ok">PASS</span>' : '<span class="err">FAIL</span>')
+        );
+      } catch (e) {
+        setTestResult(div, false, `<span class="err">Error:</span> ${e.message}\n${e.stack}`);
+      }
+    }
+
+    // ═══ Test 5: Parcel + tail (100 KiB) ═══
+    {
+      const div = addTest('test5', 'Test 5 — Parcel + tail (100 KiB, unequal subtrees)');
+      try {
+        const totalBytes = 102400; // 100 KiB
+        const data = new Uint8Array(totalBytes);
+        fillDeterministic(data);
+
+        const refHash = computeRefHash(pkg, wasmMemory, data);
+
+        const tailSize = totalBytes - PARCEL_SIZE; // 36864 bytes = 36 chunks
+        const tailChunks = Math.ceil(tailSize / CHUNK_SIZE); // 36
+
+        const cv0 = computeSubtreeCV(pkg, wasmMemory, data.slice(0, PARCEL_SIZE), 0);
+        const cvTail = computeSubtreeCV(pkg, wasmMemory, data.slice(PARCEL_SIZE), PARCEL_SIZE);
+
+        const frontier = makeFrontier(pkg);
+        frontier.pushSubtreeCV(cv0, 64);       // 64 chunks
+        frontier.pushSubtreeCV(cvTail, tailChunks); // 36 chunks — no eager merge (64 !== 36)
+
+        const stackLen = frontier.stack.length; // should be 2
+        const result = frontier.finalize();
+
+        const pass = result !== null && arraysEqual(result, refHash);
+        setTestResult(div, pass,
+          `<span class="label">Input:</span> 100 KiB (1 parcel + 36 KiB tail)\n` +
+          `<span class="label">Stack before finalize:</span> ${stackLen} entries (expected 2 — no eager merge)\n` +
+          `<span class="label">Parcel chunks:</span> 64, Tail chunks: ${tailChunks}\n` +
+          `<span class="label">Frontier:</span> <span class="hash">${hex(result)}</span>\n` +
+          `<span class="label">Ref hash:</span> <span class="hash">${hex(refHash)}</span>\n` +
+          `<span class="label">Match:</span> ${pass ? '<span class="ok">YES</span>' : '<span class="err">NO</span>'}\n` +
+          (pass ? '<span class="ok">PASS</span>' : '<span class="err">FAIL</span>')
+        );
+      } catch (e) {
+        setTestResult(div, false, `<span class="err">Error:</span> ${e.message}\n${e.stack}`);
+      }
+    }
+
+    // ═══ Test 6: End-to-end with coordinator (1 MiB) ═══
+    {
+      const div = addTest('test6', 'Test 6 — End-to-end: coordinator + frontier (1 MiB)');
+      try {
+        const WORKER_COUNT = 4;
+        const pool = new WorkerPool({ workerCount: WORKER_COUNT, wasmModule, wasmMemory, pkg });
+        await pool.init();
+        const coord = new V2Coordinator({ pool, pkg, wasmMemory });
+
+        const totalBytes = 1048576; // 1 MiB
+        const data = new Uint8Array(totalBytes);
+        fillDeterministic(data);
+
+        // Reference hash via hash_single
+        const refHash = pkg.hash_single(data);
+
+        // Run coordinator
+        const t0 = performance.now();
+        const coordResult = await coord.hashStream(makeStream(data, 16384));
+        const coordTime = (performance.now() - t0).toFixed(2);
+
+        // Feed CVs into frontier
+        const frontier = makeFrontier(pkg);
+        for (const entry of coordResult.cvs) {
+          frontier.pushSubtreeCV(entry.cv, entry.size / CHUNK_SIZE);
+        }
+        if (coordResult.tailCV) {
+          frontier.pushSubtreeCV(coordResult.tailCV, Math.ceil(coordResult.tailSize / CHUNK_SIZE));
+        }
+
+        // Allocate full data in WASM for single-entry root finalization (power-of-2 case)
+        const dataPtr = pkg.alloc_input(totalBytes);
+        new Uint8Array(wasmMemory.buffer).set(data, dataPtr);
+        const result = frontier.finalize({ ptr: dataPtr, size: totalBytes });
+        pkg.free_input(dataPtr, totalBytes);
+
+        coord.freeRingBuffer();
+        pool.destroy();
+
+        const pass = result !== null && arraysEqual(result, refHash);
+        setTestResult(div, pass,
+          `<span class="label">Input:</span> 1 MiB via coordinator (4 workers) + frontier\n` +
+          `<span class="label">Coordinator:</span> ${coordResult.cvs.length} CVs, tail=${coordResult.tailCV !== null}, time=${coordTime} ms\n` +
+          `<span class="label">Frontier:</span>    <span class="hash">${hex(result)}</span>\n` +
+          `<span class="label">hash_single:</span> <span class="hash">${hex(refHash)}</span>\n` +
+          `<span class="label">Match:</span> ${pass ? '<span class="ok">YES</span>' : '<span class="err">NO</span>'}\n` +
+          (pass ? '<span class="ok">PASS — full pipeline verified</span>' : '<span class="err">FAIL</span>')
+        );
+      } catch (e) {
+        setTestResult(div, false, `<span class="err">Error:</span> ${e.message}\n${e.stack}`);
+      }
+    }
+
+    runBtn.disabled = false;
+  }
+</script>
+</body>
+</html>
