@@ -126,6 +126,10 @@
         <td>Atomics parallel (main&rarr;4 workers)</td>
         <td>-</td><td>-</td><td>-</td><td>-</td><td>-</td><td>-</td>
       </tr>
+      <tr id="row-postmsg-par" class="pending">
+        <td>postMessage parallel (main&rarr;4 workers)</td>
+        <td>-</td><td>-</td><td>-</td><td>-</td><td>-</td><td>-</td>
+      </tr>
     </tbody>
   </table>
 
@@ -384,6 +388,54 @@
       return { ...statsFromTimes(times), wallClockAvg: (wallEnd - wallStart) / ITERATIONS };
     }
 
+    // --- Benchmark 5: postMessage parallel (main→4 workers) ---
+    async function benchPostMessageParallel() {
+      const NUM_WORKERS = 4;
+      const ITERATIONS = parseInt(document.getElementById('iter-select').value);
+      const totalRounds = WARMUP + ITERATIONS;
+      const times = new Float64Array(ITERATIONS);
+
+      // Spawn 4 workers with per-worker promise resolvers
+      const workers = [];
+      const resolvers = new Array(NUM_WORKERS);
+      for (let i = 0; i < NUM_WORKERS; i++) {
+        const w = new Worker('thread-latency-worker.js');
+        w.onmessage = () => { resolvers[i](); };
+        workers.push(w);
+      }
+
+      let wallStart = 0;
+
+      for (let round = 0; round < totalRounds; round++) {
+        if (round === WARMUP) wallStart = performance.now();
+
+        // Create per-worker promises
+        const promises = new Array(NUM_WORKERS);
+        for (let i = 0; i < NUM_WORKERS; i++) {
+          promises[i] = new Promise(r => { resolvers[i] = r; });
+        }
+
+        const t0 = performance.now();
+
+        // Fire to all 4 workers
+        for (let i = 0; i < NUM_WORKERS; i++) {
+          workers[i].postMessage({ type: 'echo', seq: round });
+        }
+
+        // Wait for all 4 replies
+        await Promise.all(promises);
+
+        const elapsed = performance.now() - t0;
+        if (round >= WARMUP) {
+          times[round - WARMUP] = elapsed;
+        }
+      }
+
+      const wallEnd = performance.now();
+      for (const w of workers) w.terminate();
+      return { ...statsFromTimes(times), wallClockAvg: (wallEnd - wallStart) / ITERATIONS };
+    }
+
     // --- Run all ---
     async function runAll() {
       runBtn.disabled = true;
@@ -391,6 +443,7 @@
       resetRow('row-atomics');
       resetRow('row-w2w');
       resetRow('row-atomics-par');
+      resetRow('row-postmsg-par');
 
       const results = {};
 
@@ -450,6 +503,16 @@
         setRow('row-atomics-par', 'skipped', ['-', '-', '-', '-', '-', 'Not supported']);
       }
 
+      // 5. postMessage parallel (main→4 workers)
+      setRow('row-postmsg-par', 'running', ['...', '...', '...', '...', '...', '...']);
+      statusEl.textContent = 'Running postMessage parallel (main→4 workers)...';
+      try {
+        results.postmsgPar = await benchPostMessageParallel();
+        setRow('row-postmsg-par', '', formatResult(results.postmsgPar));
+      } catch (err) {
+        setRow('row-postmsg-par', 'skipped', ['ERROR', err.message, '-', '-', '-', '-']);
+      }
+
       // Highlight fastest (by wall-clock avg)
       let bestRow = null;
       let bestAvg = Infinity;
@@ -457,6 +520,7 @@
       if (results.atomics && results.atomics.wallClockAvg < bestAvg) { bestAvg = results.atomics.wallClockAvg; bestRow = 'row-atomics'; }
       if (results.w2w && results.w2w.wallClockAvg < bestAvg) { bestAvg = results.w2w.wallClockAvg; bestRow = 'row-w2w'; }
       if (results.atomicsPar && results.atomicsPar.wallClockAvg < bestAvg) { bestAvg = results.atomicsPar.wallClockAvg; bestRow = 'row-atomics-par'; }
+      if (results.postmsgPar && results.postmsgPar.wallClockAvg < bestAvg) { bestAvg = results.postmsgPar.wallClockAvg; bestRow = 'row-postmsg-par'; }
       if (bestRow) document.getElementById(bestRow).classList.add('best');
 
       statusEl.textContent = 'Benchmark complete.';
@@ -466,7 +530,7 @@
     function updateNote() {
       const n = parseInt(document.getElementById('iter-select').value).toLocaleString();
       document.getElementById('note-text').textContent =
-        `${n} measured round trips per method (100 warm-up discarded). 4 methods tested. Wall Avg RT uses a single coarse timer pair for accuracy on quantized timers (Safari/iOS).`;
+        `${n} measured round trips per method (100 warm-up discarded). 5 methods tested. Wall Avg RT uses a single coarse timer pair for accuracy on quantized timers (Safari/iOS).`;
     }
     document.getElementById('iter-select').addEventListener('change', updateNote);
     updateNote();
