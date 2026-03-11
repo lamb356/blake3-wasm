@@ -1,0 +1,304 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <title>V2 Hasher Test</title>
+  <script src="coi-serviceworker.min.js"></script>
+  <style>
+    body { font-family: monospace; max-width: 900px; margin: 2em auto; background: #1a1a2e; color: #e0e0e0; }
+    h1 { color: #00d4ff; }
+    .test { border: 1px solid #333; border-radius: 6px; padding: 1em; margin: 1em 0; }
+    .test h2 { margin-top: 0; }
+    .pass { border-color: #0f0; background: #0f01; }
+    .fail { border-color: #f00; background: #f001; }
+    .running { border-color: #ff0; background: #ff01; }
+    .label { color: #888; }
+    .hash { color: #0ff; word-break: break-all; }
+    .ok { color: #0f0; font-weight: bold; }
+    .err { color: #f00; font-weight: bold; }
+    pre { white-space: pre-wrap; }
+    #run-btn { font-size: 1.2em; padding: 0.5em 2em; cursor: pointer; background: #00d4ff; color: #000; border: none; border-radius: 4px; }
+    #run-btn:disabled { opacity: 0.5; cursor: not-allowed; }
+    #summary { margin-top: 1em; font-size: 1.1em; }
+  </style>
+</head>
+<body>
+  <h1>V2 Hasher Tests</h1>
+  <p>Tests the V2Hasher single-message API: data in &rarr; BLAKE3 hash out.</p>
+  <button id="run-btn" onclick="runAllTests()">Run Tests</button>
+  <div id="summary"></div>
+  <div id="results"></div>
+
+<script type="module">
+  import { V2Hasher } from './v2-hasher.js';
+
+  window.runAllTests = runAllTests;
+
+  const resultsEl = document.getElementById('results');
+  const summaryEl = document.getElementById('summary');
+  const runBtn = document.getElementById('run-btn');
+
+  const BLAKE3_EMPTY = 'af1349b9f5f9a1a6a0404dea36dcc9499bcb25c9adc112b7cc9a93cae41f3262';
+
+  function hex(bytes) {
+    return Array.from(bytes).map(b => b.toString(16).padStart(2, '0')).join('');
+  }
+
+  function arraysEqual(a, b) {
+    if (a.length !== b.length) return false;
+    for (let i = 0; i < a.length; i++) { if (a[i] !== b[i]) return false; }
+    return true;
+  }
+
+  function addTest(id, title) {
+    const div = document.createElement('div');
+    div.className = 'test running';
+    div.id = id;
+    div.innerHTML = `<h2>${title}</h2><pre class="log">Running...</pre>`;
+    resultsEl.appendChild(div);
+    return div;
+  }
+
+  function setTestResult(div, pass, html) {
+    div.className = pass ? 'test pass' : 'test fail';
+    div.querySelector('.log').innerHTML = html;
+  }
+
+  function fillDeterministic(buf) {
+    for (let i = 0; i < buf.length; i++) buf[i] = i & 0xFF;
+  }
+
+  function makeStream(data, chunkSize = 16384) {
+    let pos = 0;
+    return new ReadableStream({
+      pull(controller) {
+        if (pos >= data.length) { controller.close(); return; }
+        const end = Math.min(pos + chunkSize, data.length);
+        controller.enqueue(data.slice(pos, end));
+        pos = end;
+      }
+    });
+  }
+
+  async function runAllTests() {
+    runBtn.disabled = true;
+    resultsEl.innerHTML = '';
+    summaryEl.innerHTML = '';
+
+    let hasher, pkg;
+    let passed = 0, failed = 0;
+
+    // Init hasher
+    try {
+      hasher = new V2Hasher({ workerCount: 4 });
+      await hasher.init();
+      pkg = hasher.pkg;
+    } catch (e) {
+      resultsEl.innerHTML = `<div class="test fail"><h2>Init Failed</h2><pre class="log"><span class="err">${e.message}</span>\n${e.stack}</pre></div>`;
+      runBtn.disabled = false;
+      return;
+    }
+
+    function check(pass) { if (pass) passed++; else failed++; }
+
+    // ═══ Test 1: Empty input ═══
+    {
+      const div = addTest('t1', 'Test 1 — Empty input (0 B)');
+      try {
+        const result = await hasher.hashBuffer(new Uint8Array(0));
+        const h = hex(result);
+        const pass = h === BLAKE3_EMPTY;
+        check(pass);
+        setTestResult(div, pass,
+          `<span class="label">Path:</span> hashBuffer → main thread\n` +
+          `<span class="label">Result:</span> <span class="hash">${h}</span>\n` +
+          `<span class="label">Expected:</span> <span class="hash">${BLAKE3_EMPTY}</span>\n` +
+          (pass ? '<span class="ok">PASS</span>' : '<span class="err">FAIL</span>')
+        );
+      } catch (e) { check(false); setTestResult(div, false, `<span class="err">Error:</span> ${e.message}\n${e.stack}`); }
+    }
+
+    // ═══ Test 2: Small "hello" (5 B) ═══
+    {
+      const div = addTest('t2', 'Test 2 — Small "hello" (5 B)');
+      try {
+        const data = new TextEncoder().encode('hello');
+        const result = await hasher.hashBuffer(data);
+        const ref = pkg.hash_single(data);
+        const pass = arraysEqual(result, ref);
+        check(pass);
+        setTestResult(div, pass,
+          `<span class="label">Path:</span> hashBuffer → main thread\n` +
+          `<span class="label">Result:</span>    <span class="hash">${hex(result)}</span>\n` +
+          `<span class="label">hash_single:</span> <span class="hash">${hex(ref)}</span>\n` +
+          `<span class="label">Match:</span> ${pass ? '<span class="ok">YES</span>' : '<span class="err">NO</span>'}\n` +
+          (pass ? '<span class="ok">PASS</span>' : '<span class="err">FAIL</span>')
+        );
+      } catch (e) { check(false); setTestResult(div, false, `<span class="err">Error:</span> ${e.message}\n${e.stack}`); }
+    }
+
+    // ═══ Test 3: Single chunk (1 KiB) ═══
+    {
+      const div = addTest('t3', 'Test 3 — Single chunk (1 KiB)');
+      try {
+        const data = new Uint8Array(1024);
+        fillDeterministic(data);
+        const result = await hasher.hashBuffer(data);
+        const ref = pkg.hash_single(data);
+        const pass = arraysEqual(result, ref);
+        check(pass);
+        setTestResult(div, pass,
+          `<span class="label">Path:</span> hashBuffer → main thread\n` +
+          `<span class="label">Result:</span>    <span class="hash">${hex(result)}</span>\n` +
+          `<span class="label">hash_single:</span> <span class="hash">${hex(ref)}</span>\n` +
+          `<span class="label">Match:</span> ${pass ? '<span class="ok">YES</span>' : '<span class="err">NO</span>'}\n` +
+          (pass ? '<span class="ok">PASS</span>' : '<span class="err">FAIL</span>')
+        );
+      } catch (e) { check(false); setTestResult(div, false, `<span class="err">Error:</span> ${e.message}\n${e.stack}`); }
+    }
+
+    // ═══ Test 4: Under parcel (32 KiB) ═══
+    {
+      const div = addTest('t4', 'Test 4 — Under parcel (32 KiB)');
+      try {
+        const data = new Uint8Array(32768);
+        fillDeterministic(data);
+        const result = await hasher.hashBuffer(data);
+        const ref = pkg.hash_single(data);
+        const pass = arraysEqual(result, ref);
+        check(pass);
+        setTestResult(div, pass,
+          `<span class="label">Path:</span> hashBuffer → main thread\n` +
+          `<span class="label">Result:</span>    <span class="hash">${hex(result)}</span>\n` +
+          `<span class="label">hash_single:</span> <span class="hash">${hex(ref)}</span>\n` +
+          `<span class="label">Match:</span> ${pass ? '<span class="ok">YES</span>' : '<span class="err">NO</span>'}\n` +
+          (pass ? '<span class="ok">PASS</span>' : '<span class="err">FAIL</span>')
+        );
+      } catch (e) { check(false); setTestResult(div, false, `<span class="err">Error:</span> ${e.message}\n${e.stack}`); }
+    }
+
+    // ═══ Test 5: Exact parcel (64 KiB) ═══
+    {
+      const div = addTest('t5', 'Test 5 — Exact parcel (64 KiB)');
+      try {
+        const data = new Uint8Array(65536);
+        fillDeterministic(data);
+        const result = await hasher.hashBuffer(data);
+        const ref = pkg.hash_single(data);
+        const pass = arraysEqual(result, ref);
+        check(pass);
+        setTestResult(div, pass,
+          `<span class="label">Path:</span> hashBuffer → main thread (≤ 1 parcel)\n` +
+          `<span class="label">Result:</span>    <span class="hash">${hex(result)}</span>\n` +
+          `<span class="label">hash_single:</span> <span class="hash">${hex(ref)}</span>\n` +
+          `<span class="label">Match:</span> ${pass ? '<span class="ok">YES</span>' : '<span class="err">NO</span>'}\n` +
+          (pass ? '<span class="ok">PASS</span>' : '<span class="err">FAIL</span>')
+        );
+      } catch (e) { check(false); setTestResult(div, false, `<span class="err">Error:</span> ${e.message}\n${e.stack}`); }
+    }
+
+    // ═══ Test 6: Parcel + tail (100 KiB) ═══
+    {
+      const div = addTest('t6', 'Test 6 — Parcel + tail (100 KiB, non-power-of-2)');
+      try {
+        const data = new Uint8Array(102400);
+        fillDeterministic(data);
+        const ref = pkg.hash_single(data);
+        const t0 = performance.now();
+        const result = await hasher.hashBuffer(data);
+        const dt = (performance.now() - t0).toFixed(2);
+        const pass = arraysEqual(result, ref);
+        check(pass);
+        setTestResult(div, pass,
+          `<span class="label">Path:</span> hashBuffer → workers (2 frontier entries, no eager merge)\n` +
+          `<span class="label">Time:</span> ${dt} ms\n` +
+          `<span class="label">Result:</span>    <span class="hash">${hex(result)}</span>\n` +
+          `<span class="label">hash_single:</span> <span class="hash">${hex(ref)}</span>\n` +
+          `<span class="label">Match:</span> ${pass ? '<span class="ok">YES</span>' : '<span class="err">NO</span>'}\n` +
+          (pass ? '<span class="ok">PASS</span>' : '<span class="err">FAIL</span>')
+        );
+      } catch (e) { check(false); setTestResult(div, false, `<span class="err">Error:</span> ${e.message}\n${e.stack}`); }
+    }
+
+    // ═══ Test 7: 1 MiB (power-of-2 tracked root finalize) ═══
+    const ref1MiB = (() => {
+      const data = new Uint8Array(1048576);
+      fillDeterministic(data);
+      return { data, ref: pkg.hash_single(data) };
+    })();
+    {
+      const div = addTest('t7', 'Test 7 — 1 MiB (16 parcels, power-of-2 tracked root finalize)');
+      try {
+        const t0 = performance.now();
+        const result = await hasher.hashBuffer(ref1MiB.data);
+        const dt = (performance.now() - t0).toFixed(2);
+        const pass = arraysEqual(result, ref1MiB.ref);
+        check(pass);
+        setTestResult(div, pass,
+          `<span class="label">Path:</span> hashBuffer → workers (16 parcels, tracked parentCvFn)\n` +
+          `<span class="label">Time:</span> ${dt} ms\n` +
+          `<span class="label">Result:</span>    <span class="hash">${hex(result)}</span>\n` +
+          `<span class="label">hash_single:</span> <span class="hash">${hex(ref1MiB.ref)}</span>\n` +
+          `<span class="label">Match:</span> ${pass ? '<span class="ok">YES</span>' : '<span class="err">NO</span>'}\n` +
+          (pass ? '<span class="ok">PASS</span>' : '<span class="err">FAIL</span>')
+        );
+      } catch (e) { check(false); setTestResult(div, false, `<span class="err">Error:</span> ${e.message}\n${e.stack}`); }
+    }
+
+    // ═══ Test 8: hashFile (1 MiB) ═══
+    {
+      const div = addTest('t8', 'Test 8 — hashFile (1 MiB File from Blob)');
+      try {
+        const blob = new Blob([ref1MiB.data]);
+        const file = new File([blob], 'test.bin');
+        const t0 = performance.now();
+        const result = await hasher.hashFile(file);
+        const dt = (performance.now() - t0).toFixed(2);
+        const pass = arraysEqual(result, ref1MiB.ref);
+        check(pass);
+        setTestResult(div, pass,
+          `<span class="label">Path:</span> hashFile → workers\n` +
+          `<span class="label">Time:</span> ${dt} ms\n` +
+          `<span class="label">Result:</span>    <span class="hash">${hex(result)}</span>\n` +
+          `<span class="label">hash_single:</span> <span class="hash">${hex(ref1MiB.ref)}</span>\n` +
+          `<span class="label">Match:</span> ${pass ? '<span class="ok">YES</span>' : '<span class="err">NO</span>'}\n` +
+          (pass ? '<span class="ok">PASS</span>' : '<span class="err">FAIL</span>')
+        );
+      } catch (e) { check(false); setTestResult(div, false, `<span class="err">Error:</span> ${e.message}\n${e.stack}`); }
+    }
+
+    // ═══ Test 9: hashStream (1 MiB) ═══
+    {
+      const div = addTest('t9', 'Test 9 — hashStream (1 MiB ReadableStream)');
+      try {
+        const stream = makeStream(ref1MiB.data, 16384);
+        const t0 = performance.now();
+        const result = await hasher.hashStream(stream);
+        const dt = (performance.now() - t0).toFixed(2);
+        const pass = arraysEqual(result, ref1MiB.ref);
+        check(pass);
+        setTestResult(div, pass,
+          `<span class="label">Path:</span> hashStream → workers\n` +
+          `<span class="label">Time:</span> ${dt} ms\n` +
+          `<span class="label">Result:</span>    <span class="hash">${hex(result)}</span>\n` +
+          `<span class="label">hash_single:</span> <span class="hash">${hex(ref1MiB.ref)}</span>\n` +
+          `<span class="label">Match:</span> ${pass ? '<span class="ok">YES</span>' : '<span class="err">NO</span>'}\n` +
+          (pass ? '<span class="ok">PASS</span>' : '<span class="err">FAIL</span>')
+        );
+      } catch (e) { check(false); setTestResult(div, false, `<span class="err">Error:</span> ${e.message}\n${e.stack}`); }
+    }
+
+    // Cleanup
+    hasher.destroy();
+
+    // Summary
+    const allPass = failed === 0;
+    summaryEl.innerHTML = allPass
+      ? `<span class="ok">${passed}/${passed} tests passed</span>`
+      : `<span class="err">${failed} failed</span>, <span class="ok">${passed} passed</span> of ${passed + failed}`;
+
+    runBtn.disabled = false;
+  }
+</script>
+</body>
+</html>
