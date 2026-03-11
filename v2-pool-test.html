@@ -1,0 +1,348 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <title>V2 Worker Pool Test</title>
+  <script src="coi-serviceworker.min.js"></script>
+  <style>
+    body { font-family: monospace; max-width: 900px; margin: 2em auto; background: #1a1a2e; color: #e0e0e0; }
+    h1 { color: #00d4ff; }
+    .test { border: 1px solid #333; border-radius: 6px; padding: 1em; margin: 1em 0; }
+    .test h2 { margin-top: 0; }
+    .pass { border-color: #0f0; background: #0f01; }
+    .fail { border-color: #f00; background: #f001; }
+    .running { border-color: #ff0; background: #ff01; }
+    .label { color: #888; }
+    .hash { color: #0ff; word-break: break-all; }
+    .ok { color: #0f0; font-weight: bold; }
+    .err { color: #f00; font-weight: bold; }
+    pre { white-space: pre-wrap; }
+    #run-btn { font-size: 1.2em; padding: 0.5em 2em; cursor: pointer; background: #00d4ff; color: #000; border: none; border-radius: 4px; }
+    #run-btn:disabled { opacity: 0.5; cursor: not-allowed; }
+  </style>
+</head>
+<body>
+  <h1>V2 Worker Pool Tests</h1>
+  <p>Tests the Atomics-based worker pool with shared WASM memory and <code>hash_subtree_ptr_into</code>.</p>
+  <button id="run-btn" onclick="runAllTests()">Run Tests</button>
+  <div id="results"></div>
+
+<script type="module">
+  import { WorkerPool } from './v2-pool.js';
+
+  window.runAllTests = runAllTests;
+
+  const resultsEl = document.getElementById('results');
+  const runBtn = document.getElementById('run-btn');
+  const PARCEL_SIZE = 65536; // 64 KiB — hard contract
+
+  function hex(bytes) {
+    return Array.from(bytes).map(b => b.toString(16).padStart(2, '0')).join('');
+  }
+
+  function arraysEqual(a, b) {
+    if (a.length !== b.length) return false;
+    for (let i = 0; i < a.length; i++) { if (a[i] !== b[i]) return false; }
+    return true;
+  }
+
+  function addTest(id, title) {
+    const div = document.createElement('div');
+    div.className = 'test running';
+    div.id = id;
+    div.innerHTML = `<h2>${title}</h2><pre class="log">Running...</pre>`;
+    resultsEl.appendChild(div);
+    return div;
+  }
+
+  function setTestResult(div, pass, html) {
+    div.className = pass ? 'test pass' : 'test fail';
+    div.querySelector('.log').innerHTML = html;
+  }
+
+  // Fill buffer with deterministic data: byte[i] = i & 0xFF
+  function fillDeterministic(buf, offset = 0) {
+    for (let i = 0; i < buf.length; i++) {
+      buf[i] = (i + offset) & 0xFF;
+    }
+  }
+
+  // Compute reference CV on main thread using hash_subtree_ptr
+  function referenceCV(pkg, wasmMemory, dataPtr, size, inputOffset) {
+    return pkg.hash_subtree_ptr(dataPtr, size, inputOffset);
+  }
+
+  async function runAllTests() {
+    runBtn.disabled = true;
+    resultsEl.innerHTML = '';
+
+    let pkg, wasmInstance, wasmModule, wasmMemory;
+
+    // ═══ Load WASM ═══
+    try {
+      pkg = await import('./blake3-wasm-shared/pkg/blake3_wasm_shared.js');
+      wasmInstance = await pkg.default();
+      wasmMemory = wasmInstance.memory;
+
+      // Compile module for workers
+      const wasmUrl = new URL('./blake3-wasm-shared/pkg/blake3_wasm_shared_bg.wasm', import.meta.url);
+      const wasmBytes = await fetch(wasmUrl).then(r => r.arrayBuffer());
+      wasmModule = await WebAssembly.compile(wasmBytes);
+    } catch (e) {
+      resultsEl.innerHTML = `<div class="test fail"><h2>Module Load Failed</h2><pre class="log"><span class="err">${e.message}</span>\n${e.stack}</pre></div>`;
+      runBtn.disabled = false;
+      return;
+    }
+
+    const WORKER_COUNT = 4;
+
+    // ═══ Test 1: Pool Init ═══
+    {
+      const div = addTest('test1', 'Test 1 — Pool Init (4 workers)');
+      try {
+        const pool = new WorkerPool({ workerCount: WORKER_COUNT, wasmModule, wasmMemory, pkg });
+        const t0 = performance.now();
+        await pool.init();
+        const elapsed = (performance.now() - t0).toFixed(1);
+
+        const pass = pool._initialized && pool.workers.length === WORKER_COUNT;
+        setTestResult(div, pass,
+          `<span class="label">Workers created:</span> ${pool.workers.length}\n` +
+          `<span class="label">Initialized:</span> ${pool._initialized ? '<span class="ok">YES</span>' : '<span class="err">NO</span>'}\n` +
+          `<span class="label">Control SAB size:</span> ${pool.controlSAB.byteLength} bytes\n` +
+          `<span class="label">CV base ptr:</span> 0x${pool.cvBasePtr.toString(16)}\n` +
+          `<span class="label">Init time:</span> ${elapsed} ms\n` +
+          (pass ? '<span class="ok">All workers ready ✓</span>' : '<span class="err">Init failed ✗</span>')
+        );
+        pool.destroy();
+      } catch (e) {
+        setTestResult(div, false, `<span class="err">Error:</span> ${e.message}\n${e.stack}`);
+      }
+    }
+
+    // ═══ Test 2: Single Parcel Correctness ═══
+    {
+      const div = addTest('test2', 'Test 2 — Single Parcel Correctness');
+      try {
+        const pool = new WorkerPool({ workerCount: WORKER_COUNT, wasmModule, wasmMemory, pkg });
+        await pool.init();
+
+        // Allocate 64 KiB in WASM heap and fill with deterministic data
+        const dataPtr = pkg.alloc_input(PARCEL_SIZE);
+        const heap = new Uint8Array(wasmMemory.buffer);
+        const parcelView = heap.subarray(dataPtr, dataPtr + PARCEL_SIZE);
+        fillDeterministic(parcelView);
+
+        // Reference: hash on main thread
+        const refCV = referenceCV(pkg, wasmMemory, dataPtr, PARCEL_SIZE, 0n);
+
+        // Worker: hash via pool
+        pool.dispatchToWorker(0, dataPtr, 0n);
+        const workerCV = await pool.waitForWorker(0);
+
+        const match = arraysEqual(refCV, workerCV);
+        setTestResult(div, match,
+          `<span class="label">Input:</span> 64 KiB deterministic (byte[i] = i & 0xFF)\n` +
+          `<span class="label">Input offset:</span> 0\n\n` +
+          `<span class="label">Main thread CV:</span> <span class="hash">${hex(refCV)}</span>\n` +
+          `<span class="label">Worker CV:</span>      <span class="hash">${hex(workerCV)}</span>\n` +
+          `<span class="label">Match:</span> ${match ? '<span class="ok">YES ✓</span>' : '<span class="err">NO ✗</span>'}`
+        );
+
+        pkg.free_input(dataPtr, PARCEL_SIZE);
+        pool.destroy();
+      } catch (e) {
+        setTestResult(div, false, `<span class="err">Error:</span> ${e.message}\n${e.stack}`);
+      }
+    }
+
+    // ═══ Test 3: Parallel Workers ═══
+    {
+      const div = addTest('test3', 'Test 3 — 4 Parcels to 4 Workers in Parallel');
+      try {
+        const pool = new WorkerPool({ workerCount: WORKER_COUNT, wasmModule, wasmMemory, pkg });
+        await pool.init();
+
+        // Allocate 4 × 64 KiB parcels
+        const totalSize = PARCEL_SIZE * WORKER_COUNT;
+        const dataPtr = pkg.alloc_input(totalSize);
+        const heap = new Uint8Array(wasmMemory.buffer);
+
+        const refCVs = [];
+        for (let i = 0; i < WORKER_COUNT; i++) {
+          const parcelPtr = dataPtr + i * PARCEL_SIZE;
+          const parcelView = heap.subarray(parcelPtr, parcelPtr + PARCEL_SIZE);
+          fillDeterministic(parcelView, i * PARCEL_SIZE);
+          const inputOffset = BigInt(i * PARCEL_SIZE);
+          refCVs.push(referenceCV(pkg, wasmMemory, parcelPtr, PARCEL_SIZE, inputOffset));
+        }
+
+        // Dispatch all 4 simultaneously
+        const t0 = performance.now();
+        for (let i = 0; i < WORKER_COUNT; i++) {
+          const parcelPtr = dataPtr + i * PARCEL_SIZE;
+          const inputOffset = BigInt(i * PARCEL_SIZE);
+          pool.dispatchToWorker(i, parcelPtr, inputOffset);
+        }
+
+        // Wait for all
+        const workerCVs = await Promise.all(
+          Array.from({ length: WORKER_COUNT }, (_, i) => pool.waitForWorker(i))
+        );
+        const elapsed = (performance.now() - t0).toFixed(2);
+
+        let allMatch = true;
+        let details = '';
+        for (let i = 0; i < WORKER_COUNT; i++) {
+          const match = arraysEqual(refCVs[i], workerCVs[i]);
+          if (!match) allMatch = false;
+          details += `<span class="label">Worker ${i}:</span> ${match ? '<span class="ok">✓</span>' : '<span class="err">✗</span>'} <span class="hash">${hex(workerCVs[i])}</span>\n`;
+        }
+
+        setTestResult(div, allMatch,
+          `<span class="label">Dispatched:</span> 4 × 64 KiB parcels to 4 workers simultaneously\n` +
+          `<span class="label">Parallel time:</span> ${elapsed} ms\n\n` +
+          details +
+          `\n${allMatch ? '<span class="ok">All CVs match reference ✓</span>' : '<span class="err">CV mismatch detected ✗</span>'}`
+        );
+
+        pkg.free_input(dataPtr, totalSize);
+        pool.destroy();
+      } catch (e) {
+        setTestResult(div, false, `<span class="err">Error:</span> ${e.message}\n${e.stack}`);
+      }
+    }
+
+    // ═══ Test 4: Sequential Same Worker ═══
+    {
+      const div = addTest('test4', 'Test 4 — 10 Parcels Sequential on Worker 0');
+      try {
+        const pool = new WorkerPool({ workerCount: WORKER_COUNT, wasmModule, wasmMemory, pkg });
+        await pool.init();
+
+        const dataPtr = pkg.alloc_input(PARCEL_SIZE);
+        const heap = new Uint8Array(wasmMemory.buffer);
+        const parcelView = heap.subarray(dataPtr, dataPtr + PARCEL_SIZE);
+
+        let allMatch = true;
+        let details = '';
+        const t0 = performance.now();
+
+        for (let i = 0; i < 10; i++) {
+          fillDeterministic(parcelView, i * 7); // vary fill pattern
+          const inputOffset = BigInt(i * PARCEL_SIZE);
+          const refCV = referenceCV(pkg, wasmMemory, dataPtr, PARCEL_SIZE, inputOffset);
+
+          pool.dispatchToWorker(0, dataPtr, inputOffset);
+          const workerCV = await pool.waitForWorker(0);
+
+          const match = arraysEqual(refCV, workerCV);
+          if (!match) allMatch = false;
+          details += `<span class="label">Parcel ${i.toString().padStart(2)}:</span> ${match ? '<span class="ok">✓</span>' : '<span class="err">✗</span>'} <span class="hash">${hex(workerCV).slice(0, 16)}...</span>\n`;
+        }
+
+        const elapsed = (performance.now() - t0).toFixed(2);
+
+        setTestResult(div, allMatch,
+          `<span class="label">10 sequential parcels on worker 0</span>\n` +
+          `<span class="label">Total time:</span> ${elapsed} ms (${(parseFloat(elapsed) / 10).toFixed(2)} ms/parcel)\n\n` +
+          details +
+          `\n${allMatch ? '<span class="ok">All 10 CVs match ✓</span>' : '<span class="err">CV mismatch ✗</span>'}`
+        );
+
+        pkg.free_input(dataPtr, PARCEL_SIZE);
+        pool.destroy();
+      } catch (e) {
+        setTestResult(div, false, `<span class="err">Error:</span> ${e.message}\n${e.stack}`);
+      }
+    }
+
+    // ═══ Test 5: Least-Loaded Dispatch ═══
+    {
+      const div = addTest('test5', 'Test 5 — 8 Parcels via getLeastLoadedWorker()');
+      try {
+        const pool = new WorkerPool({ workerCount: WORKER_COUNT, wasmModule, wasmMemory, pkg });
+        await pool.init();
+
+        const PARCEL_COUNT = 8;
+        const totalSize = PARCEL_SIZE * PARCEL_COUNT;
+        const dataPtr = pkg.alloc_input(totalSize);
+        const heap = new Uint8Array(wasmMemory.buffer);
+
+        // Fill all parcels and compute reference CVs
+        const refCVs = [];
+        for (let i = 0; i < PARCEL_COUNT; i++) {
+          const parcelPtr = dataPtr + i * PARCEL_SIZE;
+          const parcelView = heap.subarray(parcelPtr, parcelPtr + PARCEL_SIZE);
+          fillDeterministic(parcelView, i * 13);
+          const inputOffset = BigInt(i * PARCEL_SIZE);
+          refCVs.push(referenceCV(pkg, wasmMemory, parcelPtr, PARCEL_SIZE, inputOffset));
+        }
+
+        // Dispatch in waves: dispatch to all least-loaded, wait, repeat
+        // Each worker can only hold 1 task at a time (single CV slot)
+        const assignments = [];
+        const distribution = new Uint32Array(WORKER_COUNT);
+        let allMatch = true;
+
+        const t0 = performance.now();
+        let parcelIdx = 0;
+
+        while (parcelIdx < PARCEL_COUNT) {
+          // Dispatch a wave: one task per available worker
+          const wave = [];
+          const waveWorkers = new Set();
+
+          while (parcelIdx < PARCEL_COUNT && wave.length < WORKER_COUNT) {
+            const wi = pool.getLeastLoadedWorker();
+            // Skip if this worker already has a task in this wave
+            if (waveWorkers.has(wi)) break;
+
+            const parcelPtr = dataPtr + parcelIdx * PARCEL_SIZE;
+            const inputOffset = BigInt(parcelIdx * PARCEL_SIZE);
+            pool.dispatchToWorker(wi, parcelPtr, inputOffset);
+
+            wave.push({ wi, parcelIndex: parcelIdx });
+            waveWorkers.add(wi);
+            assignments.push(wi);
+            distribution[wi]++;
+            parcelIdx++;
+          }
+
+          // Wait for all in this wave
+          for (const { wi, parcelIndex } of wave) {
+            const cv = await pool.waitForWorker(wi);
+            const match = arraysEqual(refCVs[parcelIndex], cv);
+            if (!match) allMatch = false;
+          }
+        }
+
+        const elapsed = (performance.now() - t0).toFixed(2);
+
+        let distStr = '';
+        for (let i = 0; i < WORKER_COUNT; i++) {
+          const bar = '█'.repeat(distribution[i]);
+          distStr += `<span class="label">Worker ${i}:</span> ${distribution[i]} parcels ${bar}\n`;
+        }
+
+        setTestResult(div, allMatch,
+          `<span class="label">8 parcels dispatched via least-loaded strategy</span>\n` +
+          `<span class="label">Total time:</span> ${elapsed} ms\n\n` +
+          `<span class="label">Distribution:</span>\n` +
+          distStr +
+          `\n<span class="label">Assignment order:</span> [${assignments.join(', ')}]\n` +
+          `\n${allMatch ? '<span class="ok">All CVs verified ✓</span>' : '<span class="err">CV mismatch detected ✗</span>'}`
+        );
+
+        pkg.free_input(dataPtr, totalSize);
+        pool.destroy();
+      } catch (e) {
+        setTestResult(div, false, `<span class="err">Error:</span> ${e.message}\n${e.stack}`);
+      }
+    }
+
+    runBtn.disabled = false;
+  }
+</script>
+</body>
+</html>

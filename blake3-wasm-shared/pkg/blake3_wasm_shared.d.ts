@@ -17,6 +17,8 @@ export function hash_subtree(data: Uint8Array, input_offset: bigint): Uint8Array
 
 export function hash_subtree_ptr(ptr: number, size: number, input_offset: bigint): Uint8Array;
 
+export function hash_subtree_ptr_into(input_ptr: number, input_size: number, input_offset: bigint, output_ptr: number): void;
+
 export function left_subtree_len(input_len: bigint): bigint;
 
 export function parent_cv(left_cv: Uint8Array, right_cv: Uint8Array): Uint8Array;
@@ -34,6 +36,7 @@ export interface InitOutput {
     readonly hash_single: (a: number, b: number) => [number, number];
     readonly hash_subtree: (a: number, b: number, c: bigint) => [number, number];
     readonly hash_subtree_ptr: (a: number, b: number, c: bigint) => [number, number];
+    readonly hash_subtree_ptr_into: (a: number, b: number, c: bigint, d: number) => void;
     readonly left_subtree_len: (a: bigint) => bigint;
     readonly parent_cv: (a: number, b: number, c: number, d: number) => [number, number];
     readonly root_hash: (a: number, b: number, c: number, d: number) => [number, number];

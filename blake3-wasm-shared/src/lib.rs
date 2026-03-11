@@ -78,6 +78,23 @@ pub fn hash_subtree_ptr(ptr: *const u8, size: usize, input_offset: u64) -> Vec<u
 }
 
 #[wasm_bindgen]
+pub fn hash_subtree_ptr_into(
+    input_ptr: *const u8,
+    input_size: usize,
+    input_offset: u64,
+    output_ptr: *mut u8,
+) {
+    let data = unsafe { std::slice::from_raw_parts(input_ptr, input_size) };
+    let mut hasher = blake3::Hasher::new();
+    hasher.set_input_offset(input_offset);
+    hasher.update(data);
+    let cv = hasher.finalize_non_root();
+    unsafe {
+        std::ptr::copy_nonoverlapping(cv.as_ptr(), output_ptr, 32);
+    }
+}
+
+#[wasm_bindgen]
 pub fn hash_ptr(ptr: *const u8, size: usize) -> Vec<u8> {
     let data = unsafe { std::slice::from_raw_parts(ptr, size) };
     blake3::hash(data).as_bytes().to_vec()

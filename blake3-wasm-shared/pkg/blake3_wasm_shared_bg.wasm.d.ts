@@ -8,6 +8,7 @@ export const hash_ptr: (a: number, b: number) => [number, number];
 export const hash_single: (a: number, b: number) => [number, number];
 export const hash_subtree: (a: number, b: number, c: bigint) => [number, number];
 export const hash_subtree_ptr: (a: number, b: number, c: bigint) => [number, number];
+export const hash_subtree_ptr_into: (a: number, b: number, c: bigint, d: number) => void;
 export const left_subtree_len: (a: bigint) => bigint;
 export const parent_cv: (a: number, b: number, c: number, d: number) => [number, number];
 export const root_hash: (a: number, b: number, c: number, d: number) => [number, number];

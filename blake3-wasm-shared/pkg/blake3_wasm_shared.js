@@ -92,6 +92,16 @@ export function hash_subtree_ptr(ptr, size, input_offset) {
 }
 
 /**
+ * @param {number} input_ptr
+ * @param {number} input_size
+ * @param {bigint} input_offset
+ * @param {number} output_ptr
+ */
+export function hash_subtree_ptr_into(input_ptr, input_size, input_offset, output_ptr) {
+    wasm.hash_subtree_ptr_into(input_ptr, input_size, input_offset, output_ptr);
+}
+
+/**
  * @param {bigint} input_len
  * @returns {bigint}
  */
