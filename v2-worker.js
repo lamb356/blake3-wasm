@@ -31,15 +31,17 @@ async function init(data) {
 
 function mainLoop() {
   while (true) {
-    // Block until task_flag != IDLE
-    Atomics.wait(controlView, myOffset + 0, IDLE);
+    // Wait until task_flag becomes TASK or SHUTDOWN.
+    // Must handle COMPLETE state: after setting COMPLETE the worker loops back,
+    // but the main thread may not have reset to IDLE yet.
+    while (true) {
+      const flag = Atomics.load(controlView, myOffset + 0);
+      if (flag === TASK || flag === SHUTDOWN) break;
+      Atomics.wait(controlView, myOffset + 0, flag);
+    }
 
     const flag = Atomics.load(controlView, myOffset + 0);
-
-    // Check for shutdown signal
-    if (flag === SHUTDOWN) {
-      break;
-    }
+    if (flag === SHUTDOWN) break;
 
     const dataPtr    = Atomics.load(controlView, myOffset + 1);
     const offsetLo   = Atomics.load(controlView, myOffset + 2);
