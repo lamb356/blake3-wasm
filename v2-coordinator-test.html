@@ -1,0 +1,398 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <title>V2 Coordinator Test</title>
+  <script src="coi-serviceworker.min.js"></script>
+  <style>
+    body { font-family: monospace; max-width: 900px; margin: 2em auto; background: #1a1a2e; color: #e0e0e0; }
+    h1 { color: #00d4ff; }
+    .test { border: 1px solid #333; border-radius: 6px; padding: 1em; margin: 1em 0; }
+    .test h2 { margin-top: 0; }
+    .pass { border-color: #0f0; background: #0f01; }
+    .fail { border-color: #f00; background: #f001; }
+    .running { border-color: #ff0; background: #ff01; }
+    .label { color: #888; }
+    .hash { color: #0ff; word-break: break-all; }
+    .ok { color: #0f0; font-weight: bold; }
+    .err { color: #f00; font-weight: bold; }
+    pre { white-space: pre-wrap; }
+    #run-btn { font-size: 1.2em; padding: 0.5em 2em; cursor: pointer; background: #00d4ff; color: #000; border: none; border-radius: 4px; }
+    #run-btn:disabled { opacity: 0.5; cursor: not-allowed; }
+  </style>
+</head>
+<body>
+  <h1>V2 Coordinator Tests</h1>
+  <p>Tests the ring buffer coordinator with streaming dispatch over the Atomics-based worker pool.</p>
+  <button id="run-btn" onclick="runAllTests()">Run Tests</button>
+  <div id="results"></div>
+
+<script type="module">
+  import { WorkerPool } from './v2-pool.js';
+  import { V2Coordinator } from './v2-coordinator.js';
+
+  window.runAllTests = runAllTests;
+
+  const resultsEl = document.getElementById('results');
+  const runBtn = document.getElementById('run-btn');
+  const PARCEL_SIZE = 65536; // 64 KiB
+
+  function hex(bytes) {
+    return Array.from(bytes).map(b => b.toString(16).padStart(2, '0')).join('');
+  }
+
+  function arraysEqual(a, b) {
+    if (a.length !== b.length) return false;
+    for (let i = 0; i < a.length; i++) { if (a[i] !== b[i]) return false; }
+    return true;
+  }
+
+  function addTest(id, title) {
+    const div = document.createElement('div');
+    div.className = 'test running';
+    div.id = id;
+    div.innerHTML = `<h2>${title}</h2><pre class="log">Running...</pre>`;
+    resultsEl.appendChild(div);
+    return div;
+  }
+
+  function setTestResult(div, pass, html) {
+    div.className = pass ? 'test pass' : 'test fail';
+    div.querySelector('.log').innerHTML = html;
+  }
+
+  function fillDeterministic(buf, offset = 0) {
+    for (let i = 0; i < buf.length; i++) {
+      buf[i] = (i + offset) & 0xFF;
+    }
+  }
+
+  /** Create a ReadableStream from data, yielding chunks of chunkSize */
+  function makeStream(data, chunkSize = data.length) {
+    let pos = 0;
+    return new ReadableStream({
+      pull(controller) {
+        if (pos >= data.length) {
+          controller.close();
+          return;
+        }
+        const end = Math.min(pos + chunkSize, data.length);
+        controller.enqueue(data.slice(pos, end));
+        pos = end;
+      }
+    });
+  }
+
+  /** Compute reference CV on main thread using hash_subtree_ptr */
+  function computeRefCV(pkg, wasmMemory, data, inputOffset) {
+    const ptr = pkg.alloc_input(data.length);
+    const heap = new Uint8Array(wasmMemory.buffer);
+    heap.set(data, ptr);
+    const cv = pkg.hash_subtree_ptr(ptr, data.length, BigInt(inputOffset));
+    pkg.free_input(ptr, data.length);
+    return cv;
+  }
+
+  async function runAllTests() {
+    runBtn.disabled = true;
+    resultsEl.innerHTML = '';
+
+    let pkg, wasmInstance, wasmModule, wasmMemory;
+
+    // Load WASM
+    try {
+      pkg = await import('./blake3-wasm-shared/pkg/blake3_wasm_shared.js');
+      wasmInstance = await pkg.default();
+      wasmMemory = wasmInstance.memory;
+
+      const wasmUrl = new URL('./blake3-wasm-shared/pkg/blake3_wasm_shared_bg.wasm', import.meta.url);
+      const wasmBytes = await fetch(wasmUrl).then(r => r.arrayBuffer());
+      wasmModule = await WebAssembly.compile(wasmBytes);
+    } catch (e) {
+      resultsEl.innerHTML = `<div class="test fail"><h2>Module Load Failed</h2><pre class="log"><span class="err">${e.message}</span>\n${e.stack}</pre></div>`;
+      runBtn.disabled = false;
+      return;
+    }
+
+    const WORKER_COUNT = 4;
+
+    // ═══ Test 1: Small file (all tail, 32 KiB) ═══
+    {
+      const div = addTest('test1', 'Test 1 — Small file (32 KiB, all tail)');
+      try {
+        const pool = new WorkerPool({ workerCount: WORKER_COUNT, wasmModule, wasmMemory, pkg });
+        await pool.init();
+        const coord = new V2Coordinator({ pool, pkg, wasmMemory });
+
+        const data = new Uint8Array(32768);
+        fillDeterministic(data);
+        const refCV = computeRefCV(pkg, wasmMemory, data, 0);
+
+        const result = await coord.hashStream(makeStream(data));
+
+        const pass = result.cvs.length === 0
+          && result.tailCV !== null
+          && arraysEqual(result.tailCV, refCV)
+          && result.totalSize === 32768
+          && result.tailSize === 32768;
+
+        setTestResult(div, pass,
+          `<span class="label">Input:</span> 32 KiB deterministic\n` +
+          `<span class="label">cvs.length:</span> ${result.cvs.length} (expected 0)\n` +
+          `<span class="label">tailCV:</span> <span class="hash">${result.tailCV ? hex(result.tailCV) : 'null'}</span>\n` +
+          `<span class="label">refCV:</span>  <span class="hash">${hex(refCV)}</span>\n` +
+          `<span class="label">Match:</span> ${result.tailCV && arraysEqual(result.tailCV, refCV) ? '<span class="ok">YES</span>' : '<span class="err">NO</span>'}\n` +
+          `<span class="label">totalSize:</span> ${result.totalSize} (expected 32768)\n` +
+          `<span class="label">tailSize:</span> ${result.tailSize}\n` +
+          (pass ? '<span class="ok">PASS</span>' : '<span class="err">FAIL</span>')
+        );
+
+        coord.freeRingBuffer();
+        pool.destroy();
+      } catch (e) {
+        setTestResult(div, false, `<span class="err">Error:</span> ${e.message}\n${e.stack}`);
+      }
+    }
+
+    // ═══ Test 2: Exact 64 KiB (1 parcel, no tail) ═══
+    {
+      const div = addTest('test2', 'Test 2 — Exact 64 KiB (1 parcel, no tail)');
+      try {
+        const pool = new WorkerPool({ workerCount: WORKER_COUNT, wasmModule, wasmMemory, pkg });
+        await pool.init();
+        const coord = new V2Coordinator({ pool, pkg, wasmMemory });
+
+        const data = new Uint8Array(PARCEL_SIZE);
+        fillDeterministic(data);
+        const refCV = computeRefCV(pkg, wasmMemory, data, 0);
+
+        const result = await coord.hashStream(makeStream(data));
+
+        const pass = result.cvs.length === 1
+          && result.tailCV === null
+          && result.tailSize === 0
+          && arraysEqual(result.cvs[0].cv, refCV)
+          && result.cvs[0].offset === 0
+          && result.totalSize === PARCEL_SIZE;
+
+        setTestResult(div, pass,
+          `<span class="label">Input:</span> 64 KiB deterministic\n` +
+          `<span class="label">cvs.length:</span> ${result.cvs.length} (expected 1)\n` +
+          `<span class="label">cvs[0].cv:</span> <span class="hash">${result.cvs.length > 0 ? hex(result.cvs[0].cv) : 'N/A'}</span>\n` +
+          `<span class="label">refCV:</span>     <span class="hash">${hex(refCV)}</span>\n` +
+          `<span class="label">Match:</span> ${result.cvs.length > 0 && arraysEqual(result.cvs[0].cv, refCV) ? '<span class="ok">YES</span>' : '<span class="err">NO</span>'}\n` +
+          `<span class="label">tailCV:</span> ${result.tailCV === null ? 'null (correct)' : hex(result.tailCV)}\n` +
+          `<span class="label">totalSize:</span> ${result.totalSize} (expected ${PARCEL_SIZE})\n` +
+          (pass ? '<span class="ok">PASS</span>' : '<span class="err">FAIL</span>')
+        );
+
+        coord.freeRingBuffer();
+        pool.destroy();
+      } catch (e) {
+        setTestResult(div, false, `<span class="err">Error:</span> ${e.message}\n${e.stack}`);
+      }
+    }
+
+    // ═══ Test 3: 128 KiB (2 parcels, no tail) ═══
+    {
+      const div = addTest('test3', 'Test 3 — 128 KiB (2 parcels, no tail)');
+      try {
+        const pool = new WorkerPool({ workerCount: WORKER_COUNT, wasmModule, wasmMemory, pkg });
+        await pool.init();
+        const coord = new V2Coordinator({ pool, pkg, wasmMemory });
+
+        const data = new Uint8Array(2 * PARCEL_SIZE);
+        fillDeterministic(data);
+
+        const refCV0 = computeRefCV(pkg, wasmMemory, data.slice(0, PARCEL_SIZE), 0);
+        const refCV1 = computeRefCV(pkg, wasmMemory, data.slice(PARCEL_SIZE, 2 * PARCEL_SIZE), PARCEL_SIZE);
+
+        const result = await coord.hashStream(makeStream(data));
+
+        const pass = result.cvs.length === 2
+          && result.tailCV === null
+          && result.tailSize === 0
+          && result.cvs[0].offset === 0
+          && result.cvs[1].offset === PARCEL_SIZE
+          && arraysEqual(result.cvs[0].cv, refCV0)
+          && arraysEqual(result.cvs[1].cv, refCV1)
+          && result.totalSize === 2 * PARCEL_SIZE;
+
+        setTestResult(div, pass,
+          `<span class="label">Input:</span> 128 KiB deterministic\n` +
+          `<span class="label">cvs.length:</span> ${result.cvs.length} (expected 2)\n` +
+          `<span class="label">cvs[0]:</span> offset=${result.cvs[0]?.offset} <span class="hash">${result.cvs[0] ? hex(result.cvs[0].cv) : 'N/A'}</span>\n` +
+          `<span class="label">ref[0]:</span>          <span class="hash">${hex(refCV0)}</span> ${result.cvs[0] && arraysEqual(result.cvs[0].cv, refCV0) ? '<span class="ok">match</span>' : '<span class="err">mismatch</span>'}\n` +
+          `<span class="label">cvs[1]:</span> offset=${result.cvs[1]?.offset} <span class="hash">${result.cvs[1] ? hex(result.cvs[1].cv) : 'N/A'}</span>\n` +
+          `<span class="label">ref[1]:</span>          <span class="hash">${hex(refCV1)}</span> ${result.cvs[1] && arraysEqual(result.cvs[1].cv, refCV1) ? '<span class="ok">match</span>' : '<span class="err">mismatch</span>'}\n` +
+          `<span class="label">tailCV:</span> ${result.tailCV === null ? 'null (correct)' : hex(result.tailCV)}\n` +
+          `<span class="label">totalSize:</span> ${result.totalSize}\n` +
+          (pass ? '<span class="ok">PASS</span>' : '<span class="err">FAIL</span>')
+        );
+
+        coord.freeRingBuffer();
+        pool.destroy();
+      } catch (e) {
+        setTestResult(div, false, `<span class="err">Error:</span> ${e.message}\n${e.stack}`);
+      }
+    }
+
+    // ═══ Test 4: 100 KiB (1 parcel + tail) ═══
+    {
+      const div = addTest('test4', 'Test 4 — 100 KiB (1 parcel + 36 KiB tail)');
+      try {
+        const pool = new WorkerPool({ workerCount: WORKER_COUNT, wasmModule, wasmMemory, pkg });
+        await pool.init();
+        const coord = new V2Coordinator({ pool, pkg, wasmMemory });
+
+        const totalBytes = 102400; // 100 KiB
+        const data = new Uint8Array(totalBytes);
+        fillDeterministic(data);
+
+        const tailBytes = totalBytes - PARCEL_SIZE; // 36864
+        const refCV0 = computeRefCV(pkg, wasmMemory, data.slice(0, PARCEL_SIZE), 0);
+        const refTailCV = computeRefCV(pkg, wasmMemory, data.slice(PARCEL_SIZE), PARCEL_SIZE);
+
+        const result = await coord.hashStream(makeStream(data));
+
+        const pass = result.cvs.length === 1
+          && result.cvs[0].offset === 0
+          && arraysEqual(result.cvs[0].cv, refCV0)
+          && result.tailCV !== null
+          && arraysEqual(result.tailCV, refTailCV)
+          && result.tailOffset === PARCEL_SIZE
+          && result.tailSize === tailBytes
+          && result.totalSize === totalBytes;
+
+        setTestResult(div, pass,
+          `<span class="label">Input:</span> 100 KiB (102400 bytes)\n` +
+          `<span class="label">cvs.length:</span> ${result.cvs.length} (expected 1)\n` +
+          `<span class="label">cvs[0]:</span> offset=${result.cvs[0]?.offset} <span class="hash">${result.cvs[0] ? hex(result.cvs[0].cv) : 'N/A'}</span>\n` +
+          `<span class="label">ref[0]:</span>          <span class="hash">${hex(refCV0)}</span> ${result.cvs[0] && arraysEqual(result.cvs[0].cv, refCV0) ? '<span class="ok">match</span>' : '<span class="err">mismatch</span>'}\n` +
+          `<span class="label">tailCV:</span> <span class="hash">${result.tailCV ? hex(result.tailCV) : 'null'}</span>\n` +
+          `<span class="label">refTail:</span> <span class="hash">${hex(refTailCV)}</span> ${result.tailCV && arraysEqual(result.tailCV, refTailCV) ? '<span class="ok">match</span>' : '<span class="err">mismatch</span>'}\n` +
+          `<span class="label">tailOffset:</span> ${result.tailOffset} (expected ${PARCEL_SIZE})\n` +
+          `<span class="label">tailSize:</span> ${result.tailSize} (expected ${tailBytes})\n` +
+          `<span class="label">totalSize:</span> ${result.totalSize} (expected ${totalBytes})\n` +
+          (pass ? '<span class="ok">PASS</span>' : '<span class="err">FAIL</span>')
+        );
+
+        coord.freeRingBuffer();
+        pool.destroy();
+      } catch (e) {
+        setTestResult(div, false, `<span class="err">Error:</span> ${e.message}\n${e.stack}`);
+      }
+    }
+
+    // ═══ Test 5: 1 MiB (16 parcels, backpressure) ═══
+    {
+      const div = addTest('test5', 'Test 5 — 1 MiB (16 parcels, backpressure with 4 workers)');
+      try {
+        const pool = new WorkerPool({ workerCount: WORKER_COUNT, wasmModule, wasmMemory, pkg });
+        await pool.init();
+        const coord = new V2Coordinator({ pool, pkg, wasmMemory });
+
+        const totalBytes = 1048576; // 1 MiB
+        const data = new Uint8Array(totalBytes);
+        fillDeterministic(data);
+
+        // Compute all 16 reference CVs
+        const parcelCount = totalBytes / PARCEL_SIZE;
+        const refCVs = [];
+        for (let i = 0; i < parcelCount; i++) {
+          const off = i * PARCEL_SIZE;
+          refCVs.push(computeRefCV(pkg, wasmMemory, data.slice(off, off + PARCEL_SIZE), off));
+        }
+
+        const t0 = performance.now();
+        const result = await coord.hashStream(makeStream(data));
+        const elapsed = (performance.now() - t0).toFixed(2);
+
+        let allMatch = true;
+        let details = '';
+        for (let i = 0; i < parcelCount; i++) {
+          if (i < result.cvs.length) {
+            const match = arraysEqual(result.cvs[i].cv, refCVs[i]);
+            if (!match) allMatch = false;
+            details += `<span class="label">Parcel ${i.toString().padStart(2)}:</span> offset=${result.cvs[i].offset.toString().padStart(7)} ${match ? '<span class="ok">match</span>' : '<span class="err">MISMATCH</span>'}\n`;
+          } else {
+            allMatch = false;
+            details += `<span class="label">Parcel ${i.toString().padStart(2)}:</span> <span class="err">MISSING</span>\n`;
+          }
+        }
+
+        const pass = allMatch
+          && result.cvs.length === parcelCount
+          && result.tailCV === null
+          && result.tailSize === 0
+          && result.totalSize === totalBytes;
+
+        setTestResult(div, pass,
+          `<span class="label">Input:</span> 1 MiB (${totalBytes} bytes), ${parcelCount} parcels\n` +
+          `<span class="label">Time:</span> ${elapsed} ms\n` +
+          `<span class="label">cvs.length:</span> ${result.cvs.length} (expected ${parcelCount})\n` +
+          `<span class="label">tailCV:</span> ${result.tailCV === null ? 'null (correct)' : 'non-null'}\n\n` +
+          details +
+          `\n${pass ? '<span class="ok">All 16 CVs verified, backpressure worked</span>' : '<span class="err">FAIL</span>'}`
+        );
+
+        coord.freeRingBuffer();
+        pool.destroy();
+      } catch (e) {
+        setTestResult(div, false, `<span class="err">Error:</span> ${e.message}\n${e.stack}`);
+      }
+    }
+
+    // ═══ Test 6: Many small chunks (130 KiB as 1 KiB chunks) ═══
+    {
+      const div = addTest('test6', 'Test 6 — 130 KiB as 1 KiB chunks (chunk accumulation)');
+      try {
+        const pool = new WorkerPool({ workerCount: WORKER_COUNT, wasmModule, wasmMemory, pkg });
+        await pool.init();
+        const coord = new V2Coordinator({ pool, pkg, wasmMemory });
+
+        const totalBytes = 133120; // 130 KiB = 130 * 1024
+        const data = new Uint8Array(totalBytes);
+        fillDeterministic(data);
+
+        const tailBytes = totalBytes - 2 * PARCEL_SIZE; // 130*1024 - 2*65536 = 2048
+        const refCV0 = computeRefCV(pkg, wasmMemory, data.slice(0, PARCEL_SIZE), 0);
+        const refCV1 = computeRefCV(pkg, wasmMemory, data.slice(PARCEL_SIZE, 2 * PARCEL_SIZE), PARCEL_SIZE);
+        const refTailCV = computeRefCV(pkg, wasmMemory, data.slice(2 * PARCEL_SIZE), 2 * PARCEL_SIZE);
+
+        // Stream as 1 KiB chunks
+        const result = await coord.hashStream(makeStream(data, 1024));
+
+        const pass = result.cvs.length === 2
+          && result.cvs[0].offset === 0
+          && result.cvs[1].offset === PARCEL_SIZE
+          && arraysEqual(result.cvs[0].cv, refCV0)
+          && arraysEqual(result.cvs[1].cv, refCV1)
+          && result.tailCV !== null
+          && arraysEqual(result.tailCV, refTailCV)
+          && result.tailSize === tailBytes
+          && result.totalSize === totalBytes;
+
+        setTestResult(div, pass,
+          `<span class="label">Input:</span> 130 KiB as 1 KiB chunks (${totalBytes / 1024} chunks)\n` +
+          `<span class="label">cvs.length:</span> ${result.cvs.length} (expected 2)\n` +
+          `<span class="label">cvs[0]:</span> offset=${result.cvs[0]?.offset} ${result.cvs[0] && arraysEqual(result.cvs[0].cv, refCV0) ? '<span class="ok">match</span>' : '<span class="err">mismatch</span>'}\n` +
+          `<span class="label">cvs[1]:</span> offset=${result.cvs[1]?.offset} ${result.cvs[1] && arraysEqual(result.cvs[1].cv, refCV1) ? '<span class="ok">match</span>' : '<span class="err">mismatch</span>'}\n` +
+          `<span class="label">tailCV match:</span> ${result.tailCV && arraysEqual(result.tailCV, refTailCV) ? '<span class="ok">YES</span>' : '<span class="err">NO</span>'}\n` +
+          `<span class="label">tailSize:</span> ${result.tailSize} (expected ${tailBytes})\n` +
+          `<span class="label">totalSize:</span> ${result.totalSize} (expected ${totalBytes})\n` +
+          (pass ? '<span class="ok">PASS — chunk accumulation works</span>' : '<span class="err">FAIL</span>')
+        );
+
+        coord.freeRingBuffer();
+        pool.destroy();
+      } catch (e) {
+        setTestResult(div, false, `<span class="err">Error:</span> ${e.message}\n${e.stack}`);
+      }
+    }
+
+    runBtn.disabled = false;
+  }
+</script>
+</body>
+</html>

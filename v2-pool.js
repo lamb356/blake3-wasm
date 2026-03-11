@@ -33,7 +33,12 @@ export class WorkerPool {
     this.controlView = new Int32Array(this.controlSAB);
 
     // Pre-allocate CV output slots in WASM heap (32 bytes per worker)
+    // Workers write here first via hash_subtree_ptr_into, then copy to cvSAB
     this.cvBasePtr = this.pkg.alloc_input(this.workerCount * 32);
+
+    // Dedicated SharedArrayBuffer for CV output (separate from WASM heap)
+    this.cvSAB = new SharedArrayBuffer(this.workerCount * 32);
+    this.cvSABView = new Uint8Array(this.cvSAB);
 
     // Spawn workers and wait for all to be ready
     const readyPromises = [];
@@ -60,6 +65,7 @@ export class WorkerPool {
         module: this.wasmModule,
         memory: this.wasmMemory,
         controlSAB: this.controlSAB,
+        cvSAB: this.cvSAB,
         workerIndex: i,
       });
 
@@ -111,11 +117,9 @@ export class WorkerPool {
     }
     // If not async, the value already changed (worker was fast)
 
-    // Read the CV from WASM heap
-    const cvPtr = this.cvBasePtr + workerIndex * 32;
-    const wasmHeap = new Uint8Array(this.wasmMemory.buffer);
+    // Read the CV from dedicated CV SAB
     const cv = new Uint8Array(32);
-    cv.set(wasmHeap.slice(cvPtr, cvPtr + 32));
+    cv.set(this.cvSABView.subarray(workerIndex * 32, workerIndex * 32 + 32));
 
     // Reset task flag to idle
     Atomics.store(this.controlView, offset + 0, IDLE);

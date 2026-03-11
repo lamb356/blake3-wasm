@@ -12,15 +12,21 @@ const SHUTDOWN = -1;
 let controlView;
 let myOffset;
 let pkg;
+let cvSABView;
+let myWorkerIndex;
+let wasmMemory;
 
 async function init(data) {
-  const { module, memory, controlSAB, workerIndex } = data;
+  const { module, memory, controlSAB, cvSAB, workerIndex } = data;
+  wasmMemory = memory;
 
   // Dynamic import of the WASM bindings
   pkg = await import('./blake3-wasm-shared/pkg/blake3_wasm_shared.js');
   await pkg.default({ module_or_path: module, memory });
 
   controlView = new Int32Array(controlSAB);
+  cvSABView = new Uint8Array(cvSAB);
+  myWorkerIndex = workerIndex;
   myOffset = workerIndex * SLOTS_PER_WORKER;
 
   postMessage({ type: 'ready', workerIndex });
@@ -50,6 +56,10 @@ function mainLoop() {
     const inputOffset = BigInt(offsetLo >>> 0) | (BigInt(offsetHi >>> 0) << 32n);
 
     pkg.hash_subtree_ptr_into(dataPtr, 65536, inputOffset, cvPtr);
+
+    // Copy 32-byte CV from WASM heap to dedicated CV SAB
+    const heap = new Uint8Array(wasmMemory.buffer);
+    cvSABView.set(heap.subarray(cvPtr, cvPtr + 32), myWorkerIndex * 32);
 
     Atomics.store(controlView, myOffset + 0, COMPLETE);
     Atomics.notify(controlView, myOffset + 0);
