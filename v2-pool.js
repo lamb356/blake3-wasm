@@ -118,8 +118,7 @@ export class WorkerPool {
     // If not async, the value already changed (worker was fast)
 
     // Read the CV from dedicated CV SAB
-    const cv = new Uint8Array(32);
-    cv.set(this.cvSABView.subarray(workerIndex * 32, workerIndex * 32 + 32));
+    const cv = this.cvSABView.slice(workerIndex * 32, workerIndex * 32 + 32);
 
     // Reset task flag to idle
     Atomics.store(this.controlView, offset + 0, IDLE);

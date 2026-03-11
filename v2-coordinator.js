@@ -45,6 +45,7 @@ export class V2Coordinator {
         if (done) break;
 
         let chunkPos = 0;
+        let heap = new Uint8Array(this.wasmMemory.buffer);
         while (chunkPos < chunk.length) {
           // Acquire a slot if we don't have one
           if (currentSlot === -1) {
@@ -57,8 +58,6 @@ export class V2Coordinator {
           const remainChunk = chunk.length - chunkPos;
           const toCopy = Math.min(remainSlot, remainChunk);
 
-          // Write into WASM heap (re-get view in case buffer detached on grow)
-          const heap = new Uint8Array(this.wasmMemory.buffer);
           const destOffset = this.ringBasePtr + currentSlot * PARCEL_SIZE + slotBytesWritten;
           heap.set(chunk.subarray(chunkPos, chunkPos + toCopy), destOffset);
 

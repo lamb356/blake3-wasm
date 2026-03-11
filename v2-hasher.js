@@ -25,12 +25,10 @@ export class V2Hasher {
   /** Load WASM, create worker pool, ready to hash. */
   async init() {
     const pkg = await import('./blake3-wasm-shared/pkg/blake3_wasm_shared.js');
-    const wasmInstance = await pkg.default();
-    const wasmMemory = wasmInstance.memory;
-
     const wasmUrl = new URL('./blake3-wasm-shared/pkg/blake3_wasm_shared_bg.wasm', import.meta.url);
-    const wasmBytes = await fetch(wasmUrl).then(r => r.arrayBuffer());
-    const wasmModule = await WebAssembly.compile(wasmBytes);
+    const wasmModule = await WebAssembly.compileStreaming(fetch(wasmUrl));
+    const wasmInstance = await pkg.default(wasmModule);
+    const wasmMemory = wasmInstance.memory;
 
     const pool = new WorkerPool({ workerCount: this.workerCount, wasmModule, wasmMemory, pkg });
     await pool.init();

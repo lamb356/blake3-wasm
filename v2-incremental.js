@@ -45,6 +45,7 @@ export class V2IncrementalHasher {
 
   async _ingest(chunk) {
     let chunkPos = 0;
+    let heap = new Uint8Array(this.wasmMemory.buffer);
     while (chunkPos < chunk.length) {
       if (this.currentSlot === -1) {
         this.currentSlot = await this._acquireFreeSlot();
@@ -55,7 +56,6 @@ export class V2IncrementalHasher {
       const remainChunk = chunk.length - chunkPos;
       const toCopy = Math.min(remainSlot, remainChunk);
 
-      const heap = new Uint8Array(this.wasmMemory.buffer);
       const destOffset = this.ringBasePtr + this.currentSlot * PARCEL_SIZE + this.slotBytesWritten;
       heap.set(chunk.subarray(chunkPos, chunkPos + toCopy), destOffset);
 
