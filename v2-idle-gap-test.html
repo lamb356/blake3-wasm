@@ -1,0 +1,279 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <title>V2 Worker Idle Gap Test</title>
+  <script src="coi-serviceworker.min.js"></script>
+  <style>
+    body { font-family: monospace; max-width: 900px; margin: 2em auto; background: #1a1a2e; color: #e0e0e0; }
+    h1 { color: #00d4ff; }
+    .test { border: 1px solid #333; border-radius: 6px; padding: 1em; margin: 1em 0; }
+    .test h2 { margin-top: 0; }
+    .pass { border-color: #0f0; background: #0f01; }
+    .fail { border-color: #f00; background: #f001; }
+    .running { border-color: #ff0; background: #ff01; }
+    .label { color: #888; }
+    .hash { color: #0ff; word-break: break-all; }
+    .ok { color: #0f0; font-weight: bold; }
+    .err { color: #f00; font-weight: bold; }
+    pre { white-space: pre-wrap; }
+    #run-btn { font-size: 1.2em; padding: 0.5em 2em; cursor: pointer; background: #00d4ff; color: #000; border: none; border-radius: 4px; }
+    #run-btn:disabled { opacity: 0.5; cursor: not-allowed; }
+    table { border-collapse: collapse; width: 100%; margin: 1em 0; }
+    th, td { border: 1px solid #333; padding: 0.5em 0.8em; text-align: right; }
+    th { background: #222; color: #00d4ff; }
+    td:first-child, th:first-child { text-align: left; }
+    #sysinfo { color: #888; margin-bottom: 1em; }
+  </style>
+</head>
+<body>
+  <h1>V2 Worker Idle Gap Measurement</h1>
+  <p>Measures time workers sit idle between <code>waitForWorker</code> returning and the next <code>dispatchToWorker</code> to the same slot.
+    Uses a subclass of <code>V2Coordinator</code> with timing instrumentation — no source files modified.</p>
+  <div id="sysinfo"></div>
+  <button id="run-btn" onclick="runTest()">Run Test</button>
+  <div id="results"></div>
+
+<script type="module">
+  import { WorkerPool } from './v2-pool.js';
+  import { V2Coordinator } from './v2-coordinator.js';
+  import { V2Frontier } from './v2-frontier.js';
+
+  // ── System info ──
+  const sysEl = document.getElementById('sysinfo');
+  sysEl.innerHTML = [
+    `<b>Platform:</b> ${navigator.platform}`,
+    `<b>Cores:</b> ${navigator.hardwareConcurrency}`,
+    `<b>Cross-origin isolated:</b> ${crossOriginIsolated}`,
+    `<b>User agent:</b> ${navigator.userAgent}`,
+  ].join('<br>');
+
+  // ── Instrumented coordinator ──
+  const PARCEL_SIZE = 65536;
+
+  class InstrumentedCoordinator extends V2Coordinator {
+    constructor(opts) {
+      super(opts);
+      this._idleSince = null;
+      this._idleTotal = null;
+      this._idleCount = null;
+    }
+
+    async hashStream(stream) {
+      const wc = this.pool.workerCount;
+      this._idleSince = new Float64Array(wc);
+      this._idleTotal = new Float64Array(wc);
+      this._idleCount = new Uint32Array(wc);
+      const result = await super.hashStream(stream);
+      return result;
+    }
+
+    async _acquireFreeSlot(slotFree, pending, collectedCVs) {
+      const pendingBefore = pending.length;
+      const idx = await super._acquireFreeSlot(slotFree, pending, collectedCVs);
+      // Only record idle start if we drained a worker (pending shrank = backpressure path)
+      if (this._idleSince && pending.length < pendingBefore) {
+        this._idleSince[idx] = performance.now();
+      }
+      return idx;
+    }
+
+    _dispatchSlot(slotIndex, parcelFileOffset, slotFree, pending) {
+      if (this._idleSince && this._idleSince[slotIndex] > 0) {
+        const gap = performance.now() - this._idleSince[slotIndex];
+        this._idleTotal[slotIndex] += gap;
+        this._idleCount[slotIndex]++;
+        this._idleSince[slotIndex] = 0;
+      }
+      super._dispatchSlot(slotIndex, parcelFileOffset, slotFree, pending);
+    }
+
+    getIdleStats() {
+      const wc = this.pool.workerCount;
+      const stats = [];
+      for (let i = 0; i < wc; i++) {
+        stats.push({
+          worker: i,
+          gaps: this._idleCount[i],
+          avgMs: this._idleCount[i] ? this._idleTotal[i] / this._idleCount[i] : 0,
+          totalMs: this._idleTotal[i],
+        });
+      }
+      return stats;
+    }
+  }
+
+  // ── WASM + pool init (same as V2Hasher.init) ──
+  async function initWasm() {
+    const pkg = await import('./blake3-wasm-shared/pkg/blake3_wasm_shared.js');
+    const wasmUrl = new URL('./blake3-wasm-shared/pkg/blake3_wasm_shared_bg.wasm', import.meta.url);
+    const wasmModule = await WebAssembly.compileStreaming(fetch(wasmUrl));
+    const wasmInstance = await pkg.default(wasmModule);
+    const wasmMemory = wasmInstance.memory;
+    const workerCount = navigator.hardwareConcurrency || 4;
+    const pool = new WorkerPool({ workerCount, wasmModule, wasmMemory, pkg });
+    await pool.init();
+    return { pkg, wasmMemory, pool };
+  }
+
+  // ── Hash with frontier (same logic as V2Hasher._hashWithWorkers) ──
+  function finalizeHash(pkg, wasmMemory, coord, coordResult) {
+    const CHUNK_SIZE = 1024;
+    if (coordResult.totalSize === 0) {
+      coord.freeRingBuffer();
+      return pkg.hash_single(new Uint8Array(0));
+    }
+    const entries = [];
+    for (const e of coordResult.cvs) {
+      entries.push({ cv: e.cv, subtreeChunks: e.size / CHUNK_SIZE });
+    }
+    if (coordResult.tailCV) {
+      entries.push({ cv: coordResult.tailCV, subtreeChunks: Math.ceil(coordResult.tailSize / CHUNK_SIZE) });
+    }
+
+    let result;
+    if (entries.length === 1) {
+      result = pkg.hash_ptr(coord.ringBasePtr, coordResult.totalSize);
+    } else {
+      let lastLeft = null, lastRight = null;
+      const parentCvTracked = (l, r) => { lastLeft = l; lastRight = r; return pkg.parent_cv(l, r); };
+      const frontier = new V2Frontier({
+        parentCvFn: parentCvTracked,
+        rootHashFn: (l, r) => pkg.root_hash(l, r),
+        hashPtrFn: (ptr, size) => pkg.hash_ptr(ptr, size),
+      });
+      for (const e of entries) frontier.pushSubtreeCV(e.cv, e.subtreeChunks);
+      if (frontier.stack.length === 1 && lastLeft && lastRight) {
+        result = pkg.root_hash(lastLeft, lastRight);
+      } else if (frontier.stack.length >= 2) {
+        result = frontier.finalize();
+      } else {
+        result = frontier.stack[0].cv;
+      }
+    }
+    coord.freeRingBuffer();
+    return result;
+  }
+
+  // ── Make synthetic buffer as ReadableStream ──
+  function syntheticStream(sizeBytes) {
+    let remaining = sizeBytes;
+    return new ReadableStream({
+      pull(controller) {
+        if (remaining <= 0) { controller.close(); return; }
+        const chunkSize = Math.min(16384, remaining);
+        const buf = new Uint8Array(chunkSize);
+        // Fill with deterministic pattern
+        for (let i = 0; i < chunkSize; i++) buf[i] = (remaining + i) & 0xff;
+        controller.enqueue(buf);
+        remaining -= chunkSize;
+      }
+    });
+  }
+
+  function formatSize(bytes) {
+    if (bytes >= 1048576) return `${bytes / 1048576} MiB`;
+    if (bytes >= 1024) return `${bytes / 1024} KiB`;
+    return `${bytes} B`;
+  }
+
+  // ── Main test runner ──
+  const sizes = [
+    4 * 1048576,    //   4 MiB
+    16 * 1048576,   //  16 MiB
+    64 * 1048576,   //  64 MiB
+    256 * 1048576,  // 256 MiB
+  ];
+
+  async function runTest() {
+    const btn = document.getElementById('run-btn');
+    const resultsEl = document.getElementById('results');
+    btn.disabled = true;
+    resultsEl.innerHTML = '<div class="test running"><h2>Initializing WASM + workers...</h2></div>';
+
+    try {
+      const { pkg, wasmMemory, pool } = await initWasm();
+      const workerCount = pool.workerCount;
+
+      resultsEl.innerHTML = `<p><span class="label">Workers:</span> ${workerCount}</p>`;
+
+      // Build table
+      const table = document.createElement('table');
+      table.innerHTML = `<thead><tr>
+        <th>Size</th>
+        <th>Parcels</th>
+        <th>Gaps/worker</th>
+        <th>Avg gap (ms)</th>
+        <th>Total idle/worker (ms)</th>
+        <th>Wall time (ms)</th>
+        <th>Idle %</th>
+      </tr></thead>`;
+      const tbody = document.createElement('tbody');
+      table.appendChild(tbody);
+      resultsEl.appendChild(table);
+
+      // Per-worker detail container
+      const detailEl = document.createElement('div');
+      detailEl.id = 'worker-detail';
+      resultsEl.appendChild(detailEl);
+
+      for (const size of sizes) {
+        const parcels = Math.floor(size / PARCEL_SIZE);
+        const label = formatSize(size);
+
+        // Add running row
+        const runRow = tbody.insertRow();
+        runRow.innerHTML = `<td>${label}</td><td colspan="6" style="color:#ff0">Running...</td>`;
+
+        const coord = new InstrumentedCoordinator({ pool, pkg, wasmMemory });
+        const stream = syntheticStream(size);
+
+        const t0 = performance.now();
+        const coordResult = await coord.hashStream(stream);
+        const wallMs = performance.now() - t0;
+
+        // Finalize hash to confirm correctness
+        const hash = finalizeHash(pkg, wasmMemory, coord, coordResult);
+        const hexHash = [...hash].map(b => b.toString(16).padStart(2, '0')).join('');
+
+        const stats = coord.getIdleStats();
+        const avgGaps = stats.reduce((s, w) => s + w.gaps, 0) / workerCount;
+        const avgGapMs = stats.reduce((s, w) => s + w.avgMs, 0) / workerCount;
+        const avgTotalMs = stats.reduce((s, w) => s + w.totalMs, 0) / workerCount;
+        const idlePct = (avgTotalMs / wallMs * 100);
+
+        // Replace running row
+        runRow.innerHTML = `
+          <td>${label}</td>
+          <td>${parcels}</td>
+          <td>${avgGaps.toFixed(1)}</td>
+          <td>${avgGapMs.toFixed(4)}</td>
+          <td>${avgTotalMs.toFixed(3)}</td>
+          <td>${wallMs.toFixed(1)}</td>
+          <td>${idlePct.toFixed(2)}%</td>`;
+        runRow.style.color = '#e0e0e0';
+
+        // Per-worker detail
+        const detail = document.createElement('div');
+        detail.className = 'test pass';
+        detail.innerHTML = `<h2>${label} — per-worker detail</h2>
+          <pre class="log"><span class="label">Hash:</span> <span class="hash">${hexHash}</span>
+${stats.map(w =>
+  `  Worker ${w.worker}: ${w.gaps} gaps, avg ${w.avgMs.toFixed(4)} ms, total ${w.totalMs.toFixed(3)} ms`
+).join('\n')}</pre>`;
+        detailEl.appendChild(detail);
+      }
+
+      pool.destroy();
+
+    } catch (err) {
+      resultsEl.innerHTML += `<div class="test fail"><h2>Error</h2><pre class="log"><span class="err">${err.message}</span>\n${err.stack}</pre></div>`;
+    } finally {
+      btn.disabled = false;
+    }
+  }
+
+  window.runTest = runTest;
+</script>
+</body>
+</html>
