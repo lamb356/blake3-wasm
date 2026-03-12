@@ -1,0 +1,431 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <title>WASM Module Comparison: hazmat vs public API</title>
+  <script src="coi-serviceworker.min.js"></script>
+  <style>
+    body { font-family: monospace; max-width: 1100px; margin: 2em auto; background: #1a1a2e; color: #e0e0e0; padding: 0 1em; }
+    h1 { color: #00d4ff; }
+    h2 { color: #00d4ff; margin-top: 1.5em; }
+    .test { border: 1px solid #333; border-radius: 6px; padding: 1em; margin: 1em 0; }
+    .pass { border-color: #0f0; background: #0f01; }
+    .fail { border-color: #f00; background: #f001; }
+    .running { border-color: #ff0; background: #ff01; }
+    .ok { color: #0f0; font-weight: bold; }
+    .err { color: #f00; font-weight: bold; }
+    .hash { color: #0ff; word-break: break-all; font-size: 0.85em; }
+    pre { white-space: pre-wrap; }
+    #run-btn { font-size: 1.2em; padding: 0.5em 2em; cursor: pointer; background: #00d4ff; color: #000; border: none; border-radius: 4px; font-family: monospace; font-weight: bold; }
+    #run-btn:disabled { opacity: 0.5; cursor: not-allowed; }
+    #sysinfo { color: #888; margin: 1em 0; font-size: 0.9em; }
+    table { border-collapse: collapse; width: 100%; margin: 1em 0; }
+    th { background: #222; color: #00d4ff; text-align: left; padding: 8px 12px; border: 1px solid #333; }
+    td { padding: 8px 12px; border: 1px solid #333; }
+    tr:nth-child(even) { background: #1e1e3a; }
+    .winner { background: #0f02; color: #0f0; font-weight: bold; }
+    .loser { color: #888; }
+    .diff-better { color: #0f0; }
+    .diff-worse { color: #f44; }
+    #log { margin: 1em 0; padding: 1em; background: #111; border-radius: 6px; max-height: 300px; overflow-y: auto; font-size: 0.85em; }
+    .log-line { margin: 2px 0; }
+  </style>
+</head>
+<body>
+  <h1>WASM Module Comparison</h1>
+  <p>Compares <b>Old</b> (blake3-wasm-shared, hazmat/internal API) vs <b>New</b> (zooko-streaming, public subtree API).</p>
+  <p>Both modules use the same BLAKE3 compression core. The difference is the JS↔WASM binding style.</p>
+
+  <div id="sysinfo"></div>
+  <button id="run-btn" onclick="runBenchmarks()">Run Benchmarks</button>
+
+  <h2>Hash Correctness</h2>
+  <div id="verification"></div>
+
+  <h2>Benchmark Results</h2>
+  <div id="results">
+    <p style="color:#888">Click "Run Benchmarks" to start.</p>
+  </div>
+
+  <h2>Log</h2>
+  <div id="log"></div>
+
+<script type="module">
+  // --- System info ---
+  const sysEl = document.getElementById('sysinfo');
+  const coi = typeof SharedArrayBuffer !== 'undefined';
+  sysEl.innerHTML = [
+    `Platform: ${navigator.platform}`,
+    `Cores: ${navigator.hardwareConcurrency}`,
+    `Cross-Origin Isolated: ${coi ? '<span class="ok">YES</span>' : '<span class="err">NO</span>'}`,
+    `UA: ${navigator.userAgent.slice(0, 120)}`,
+  ].join(' | ');
+
+  // --- Logging ---
+  const logEl = document.getElementById('log');
+  function log(msg) {
+    const line = document.createElement('div');
+    line.className = 'log-line';
+    line.textContent = `[${performance.now().toFixed(1)}ms] ${msg}`;
+    logEl.appendChild(line);
+    logEl.scrollTop = logEl.scrollHeight;
+    console.log(msg);
+  }
+
+  // --- Hex helper ---
+  function hex(bytes) {
+    return Array.from(bytes).map(b => b.toString(16).padStart(2, '0')).join('');
+  }
+
+  function arraysEqual(a, b) {
+    if (a.length !== b.length) return false;
+    for (let i = 0; i < a.length; i++) { if (a[i] !== b[i]) return false; }
+    return true;
+  }
+
+  // --- Module loading ---
+  let oldPkg, oldWasm, newPkg, newWasm;
+
+  async function loadModules() {
+    log('Loading old module (blake3-wasm-shared)...');
+    oldPkg = await import('./blake3-wasm-shared/pkg/blake3_wasm_shared.js');
+    oldWasm = await oldPkg.default();
+    log(`Old module loaded. Memory: ${oldWasm.memory.buffer.byteLength} bytes`);
+
+    log('Loading new module (zooko-streaming)...');
+    newPkg = await import('./zooko-streaming-pkg/blake3_wasm_streaming.js');
+    newWasm = await newPkg.default();
+    log(`New module loaded. Memory: ${newWasm.memory.buffer.byteLength} bytes`);
+  }
+
+  // --- Wrapper objects ---
+  function wrapOldModule() {
+    return {
+      name: 'Old (hazmat)',
+      memory: oldWasm.memory,
+      alloc: (n) => oldPkg.alloc_input(n),
+      free: (ptr, n) => oldPkg.free_input(ptr, n),
+      hashSubtree(dataPtr, size, offset, outPtr) {
+        oldPkg.hash_subtree_ptr_into(dataPtr, size, BigInt(offset), outPtr);
+      },
+      parentCv(leftPtr, rightPtr, outPtr) {
+        const heap = new Uint8Array(oldWasm.memory.buffer);
+        const left = heap.slice(leftPtr, leftPtr + 32);
+        const right = heap.slice(rightPtr, rightPtr + 32);
+        const result = oldPkg.parent_cv(left, right);
+        new Uint8Array(oldWasm.memory.buffer).set(result, outPtr);
+      },
+      rootHash(leftPtr, rightPtr, outPtr) {
+        const heap = new Uint8Array(oldWasm.memory.buffer);
+        const left = heap.slice(leftPtr, leftPtr + 32);
+        const right = heap.slice(rightPtr, rightPtr + 32);
+        const result = oldPkg.root_hash(left, right);
+        new Uint8Array(oldWasm.memory.buffer).set(result, outPtr);
+      },
+    };
+  }
+
+  function wrapNewModule() {
+    return {
+      name: 'New (public API)',
+      memory: newWasm.memory,
+      alloc: (n) => newPkg.alloc(n),
+      free: (ptr, n) => newPkg.dealloc(ptr, n),
+      hashSubtree(dataPtr, size, offset, outPtr) {
+        const lo = offset & 0xFFFFFFFF;
+        const hi = (offset / 0x100000000) >>> 0;
+        newPkg.hash_subtree_cv_from_ptr(dataPtr, size, lo, hi, outPtr);
+      },
+      parentCv(leftPtr, rightPtr, outPtr) {
+        newPkg.parent_cv_from_ptrs(leftPtr, rightPtr, outPtr);
+      },
+      rootHash(leftPtr, rightPtr, outPtr) {
+        newPkg.root_hash_from_ptrs(leftPtr, rightPtr, outPtr);
+      },
+    };
+  }
+
+  // --- Benchmark helpers ---
+  const SIZES = [
+    { label: '64 KiB',  bytes: 64 * 1024,   iters: 50, warmup: 5 },
+    { label: '1 MiB',   bytes: 1024 * 1024,  iters: 20, warmup: 3 },
+    { label: '16 MiB',  bytes: 16 * 1024 * 1024, iters: 5, warmup: 2 },
+  ];
+
+  function fillDeterministic(heap, ptr, size) {
+    for (let i = 0; i < size; i++) heap[ptr + i] = i & 0xff;
+  }
+
+  function benchHashSubtree(mod, size, iterations, warmup) {
+    const dataPtr = mod.alloc(size);
+    const outPtr = mod.alloc(32);
+    const heap = new Uint8Array(mod.memory.buffer);
+    fillDeterministic(heap, dataPtr, size);
+
+    // Warmup
+    for (let i = 0; i < warmup; i++) mod.hashSubtree(dataPtr, size, 0, outPtr);
+
+    // Timed runs
+    const times = [];
+    for (let i = 0; i < iterations; i++) {
+      const t0 = performance.now();
+      mod.hashSubtree(dataPtr, size, 0, outPtr);
+      times.push(performance.now() - t0);
+    }
+
+    // Read result for verification
+    const cv = new Uint8Array(mod.memory.buffer, outPtr, 32).slice();
+
+    mod.free(outPtr, 32);
+    mod.free(dataPtr, size);
+
+    times.sort((a, b) => a - b);
+    return { medianMs: times[Math.floor(times.length / 2)], cv, times };
+  }
+
+  function benchParentCvOrRoot(mod, fnName, batchSize, batches, warmup) {
+    const leftPtr = mod.alloc(32);
+    const rightPtr = mod.alloc(32);
+    const outPtr = mod.alloc(32);
+    const heap = new Uint8Array(mod.memory.buffer);
+    // Fill with deterministic CVs
+    for (let i = 0; i < 32; i++) {
+      heap[leftPtr + i] = i;
+      heap[rightPtr + i] = (i + 0x80) & 0xff;
+    }
+
+    const fn = fnName === 'parentCv' ? mod.parentCv : mod.rootHash;
+
+    // Warmup
+    for (let i = 0; i < warmup * batchSize; i++) fn(leftPtr, rightPtr, outPtr);
+
+    // Timed batches
+    const times = [];
+    for (let b = 0; b < batches; b++) {
+      const t0 = performance.now();
+      for (let i = 0; i < batchSize; i++) fn(leftPtr, rightPtr, outPtr);
+      times.push(performance.now() - t0);
+    }
+
+    const cv = new Uint8Array(mod.memory.buffer, outPtr, 32).slice();
+
+    mod.free(outPtr, 32);
+    mod.free(rightPtr, 32);
+    mod.free(leftPtr, 32);
+
+    times.sort((a, b) => a - b);
+    const medianMs = times[Math.floor(times.length / 2)];
+    return { medianMs, perCallUs: (medianMs / batchSize) * 1000, cv, times };
+  }
+
+  // --- Verification ---
+  function runVerification(oldMod, newMod) {
+    const verEl = document.getElementById('verification');
+    verEl.innerHTML = '';
+    let allPass = true;
+
+    for (const { label, bytes } of SIZES) {
+      const div = document.createElement('div');
+      div.className = 'test running';
+
+      const oldResult = benchHashSubtree(oldMod, bytes, 1, 0);
+      const newResult = benchHashSubtree(newMod, bytes, 1, 0);
+      const match = arraysEqual(oldResult.cv, newResult.cv);
+
+      if (match) {
+        div.className = 'test pass';
+        div.innerHTML = `<b>hash_subtree ${label}</b>: <span class="ok">MATCH</span><br>
+          <span class="hash">${hex(oldResult.cv)}</span>`;
+      } else {
+        div.className = 'test fail';
+        div.innerHTML = `<b>hash_subtree ${label}</b>: <span class="err">MISMATCH</span><br>
+          Old: <span class="hash">${hex(oldResult.cv)}</span><br>
+          New: <span class="hash">${hex(newResult.cv)}</span>`;
+        allPass = false;
+      }
+      verEl.appendChild(div);
+    }
+
+    // Verify parent_cv
+    {
+      const div = document.createElement('div');
+      div.className = 'test running';
+      const oldResult = benchParentCvOrRoot(oldMod, 'parentCv', 1, 1, 0);
+      const newResult = benchParentCvOrRoot(newMod, 'parentCv', 1, 1, 0);
+      const match = arraysEqual(oldResult.cv, newResult.cv);
+      if (match) {
+        div.className = 'test pass';
+        div.innerHTML = `<b>parent_cv</b>: <span class="ok">MATCH</span><br>
+          <span class="hash">${hex(oldResult.cv)}</span>`;
+      } else {
+        div.className = 'test fail';
+        div.innerHTML = `<b>parent_cv</b>: <span class="err">MISMATCH</span><br>
+          Old: <span class="hash">${hex(oldResult.cv)}</span><br>
+          New: <span class="hash">${hex(newResult.cv)}</span>`;
+        allPass = false;
+      }
+      verEl.appendChild(div);
+    }
+
+    // Verify root_hash
+    {
+      const div = document.createElement('div');
+      div.className = 'test running';
+      const oldResult = benchParentCvOrRoot(oldMod, 'rootHash', 1, 1, 0);
+      const newResult = benchParentCvOrRoot(newMod, 'rootHash', 1, 1, 0);
+      const match = arraysEqual(oldResult.cv, newResult.cv);
+      if (match) {
+        div.className = 'test pass';
+        div.innerHTML = `<b>root_hash</b>: <span class="ok">MATCH</span><br>
+          <span class="hash">${hex(oldResult.cv)}</span>`;
+      } else {
+        div.className = 'test fail';
+        div.innerHTML = `<b>root_hash</b>: <span class="err">MISMATCH</span><br>
+          Old: <span class="hash">${hex(oldResult.cv)}</span><br>
+          New: <span class="hash">${hex(newResult.cv)}</span>`;
+        allPass = false;
+      }
+      verEl.appendChild(div);
+    }
+
+    return allPass;
+  }
+
+  // --- Results table ---
+  function renderResults(rows) {
+    const resultsEl = document.getElementById('results');
+    let html = `<table>
+      <tr>
+        <th>Operation</th><th>Size</th>
+        <th>Old (ms)</th><th>Old (MB/s)</th>
+        <th>New (ms)</th><th>New (MB/s)</th>
+        <th>Diff</th>
+      </tr>`;
+
+    for (const r of rows) {
+      const diffPct = ((r.newMs - r.oldMs) / r.oldMs * 100);
+      const diffStr = diffPct.toFixed(1) + '%';
+      const diffClass = diffPct < -1 ? 'diff-better' : diffPct > 1 ? 'diff-worse' : '';
+      const oldWin = r.oldMs < r.newMs;
+      html += `<tr>
+        <td>${r.op}</td>
+        <td>${r.size}</td>
+        <td class="${oldWin ? 'winner' : 'loser'}">${r.oldMs.toFixed(3)}</td>
+        <td class="${oldWin ? 'winner' : ''}">${r.oldMBs}</td>
+        <td class="${!oldWin ? 'winner' : 'loser'}">${r.newMs.toFixed(3)}</td>
+        <td class="${!oldWin ? 'winner' : ''}">${r.newMBs}</td>
+        <td class="${diffClass}">${diffPct < 0 ? '' : '+'}${diffStr}</td>
+      </tr>`;
+    }
+
+    html += '</table>';
+    resultsEl.innerHTML = html;
+  }
+
+  // --- Main benchmark ---
+  async function runBenchmarks() {
+    const btn = document.getElementById('run-btn');
+    btn.disabled = true;
+    logEl.innerHTML = '';
+    document.getElementById('verification').innerHTML = '';
+    document.getElementById('results').innerHTML = '<p style="color:#ff0">Running...</p>';
+
+    try {
+      await loadModules();
+      const oldMod = wrapOldModule();
+      const newMod = wrapNewModule();
+
+      // Verification
+      log('Running hash correctness checks...');
+      const allPass = runVerification(oldMod, newMod);
+      if (!allPass) {
+        log('VERIFICATION FAILED — benchmarks may not be comparable');
+      } else {
+        log('All hashes match!');
+      }
+
+      // Allow UI to update
+      await new Promise(r => setTimeout(r, 50));
+
+      // Benchmark hash_subtree
+      const rows = [];
+      for (const { label, bytes, iters, warmup } of SIZES) {
+        log(`Benchmarking hash_subtree ${label} (${iters} iters)...`);
+
+        await new Promise(r => setTimeout(r, 10));
+        const oldResult = benchHashSubtree(oldMod, bytes, iters, warmup);
+        log(`  Old: ${oldResult.medianMs.toFixed(3)} ms`);
+
+        await new Promise(r => setTimeout(r, 10));
+        const newResult = benchHashSubtree(newMod, bytes, iters, warmup);
+        log(`  New: ${newResult.medianMs.toFixed(3)} ms`);
+
+        const mbPerSec = (ms) => ms > 0 ? ((bytes / 1024 / 1024) / (ms / 1000)).toFixed(1) : '∞';
+
+        rows.push({
+          op: 'hash_subtree',
+          size: label,
+          oldMs: oldResult.medianMs,
+          oldMBs: mbPerSec(oldResult.medianMs),
+          newMs: newResult.medianMs,
+          newMBs: mbPerSec(newResult.medianMs),
+        });
+      }
+
+      // Benchmark parent_cv
+      const BATCH = 10000;
+      const BATCHES = 10;
+      const WARMUP_BATCHES = 2;
+
+      log(`Benchmarking parent_cv (${BATCHES} batches of ${BATCH})...`);
+      await new Promise(r => setTimeout(r, 10));
+      const oldPcv = benchParentCvOrRoot(oldMod, 'parentCv', BATCH, BATCHES, WARMUP_BATCHES);
+      log(`  Old: ${oldPcv.medianMs.toFixed(3)} ms/batch (${oldPcv.perCallUs.toFixed(3)} µs/call)`);
+
+      await new Promise(r => setTimeout(r, 10));
+      const newPcv = benchParentCvOrRoot(newMod, 'parentCv', BATCH, BATCHES, WARMUP_BATCHES);
+      log(`  New: ${newPcv.medianMs.toFixed(3)} ms/batch (${newPcv.perCallUs.toFixed(3)} µs/call)`);
+
+      rows.push({
+        op: 'parent_cv',
+        size: `${BATCH}/batch`,
+        oldMs: oldPcv.medianMs,
+        oldMBs: `${oldPcv.perCallUs.toFixed(3)} µs/call`,
+        newMs: newPcv.medianMs,
+        newMBs: `${newPcv.perCallUs.toFixed(3)} µs/call`,
+      });
+
+      // Benchmark root_hash
+      log(`Benchmarking root_hash (${BATCHES} batches of ${BATCH})...`);
+      await new Promise(r => setTimeout(r, 10));
+      const oldRh = benchParentCvOrRoot(oldMod, 'rootHash', BATCH, BATCHES, WARMUP_BATCHES);
+      log(`  Old: ${oldRh.medianMs.toFixed(3)} ms/batch (${oldRh.perCallUs.toFixed(3)} µs/call)`);
+
+      await new Promise(r => setTimeout(r, 10));
+      const newRh = benchParentCvOrRoot(newMod, 'rootHash', BATCH, BATCHES, WARMUP_BATCHES);
+      log(`  New: ${newRh.medianMs.toFixed(3)} ms/batch (${newRh.perCallUs.toFixed(3)} µs/call)`);
+
+      rows.push({
+        op: 'root_hash',
+        size: `${BATCH}/batch`,
+        oldMs: oldRh.medianMs,
+        oldMBs: `${oldRh.perCallUs.toFixed(3)} µs/call`,
+        newMs: newRh.medianMs,
+        newMBs: `${newRh.perCallUs.toFixed(3)} µs/call`,
+      });
+
+      renderResults(rows);
+      log('Done!');
+    } catch (e) {
+      log(`ERROR: ${e.message || e}`);
+      console.error(e);
+      document.getElementById('results').innerHTML = `<div class="test fail"><b>Error:</b> ${e.message || e}</div>`;
+    } finally {
+      btn.disabled = false;
+    }
+  }
+
+  window.runBenchmarks = runBenchmarks;
+</script>
+</body>
+</html>
