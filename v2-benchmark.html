@@ -441,8 +441,6 @@ async function runSyntheticBenchmark() {
     rows.push(row);
   }
 
-  let overallMax = 0;
-
   for (let i = 0; i < SIZES.length; i++) {
     const size = SIZES[i];
     const iterations = size <= 1024 * 1024 ? 10 : 3;
@@ -453,26 +451,15 @@ async function runSyntheticBenchmark() {
     fillDeterministic(data);
 
     const { blake3MBps, sha256MBps } = await benchmarkSize(data, 1, iterations);
-    const maxMBps = Math.max(blake3MBps, sha256MBps, overallMax);
-    overallMax = maxMBps;
 
-    // Update all bars with new scale
-    updateRow(rows[i], blake3MBps, sha256MBps, maxMBps);
-
-    // Re-scale previous rows
-    for (let j = 0; j < i; j++) {
-      const prev = rows[j];
-      const b3 = parseFloat(prev.dataset.blake3 || 0);
-      const sha = parseFloat(prev.dataset.sha256 || 0);
-      rescaleRow(prev, b3, sha, overallMax);
-    }
+    updateRow(rows[i], blake3MBps, sha256MBps);
   }
 
   status.textContent = 'Benchmark complete.';
   btn.disabled = false;
 }
 
-function updateRow(row, blake3MBps, sha256MBps, maxMBps) {
+function updateRow(row, blake3MBps, sha256MBps) {
   row.dataset.blake3 = blake3MBps;
   row.dataset.sha256 = sha256MBps;
 
@@ -481,8 +468,9 @@ function updateRow(row, blake3MBps, sha256MBps, maxMBps) {
   const b3Badge = row.querySelector('[data-algo="blake3"]');
   const shaBadge = row.querySelector('[data-algo="sha256"]');
 
-  const b3Pct = Math.max((blake3MBps / maxMBps) * 100, 2);
-  const shaPct = Math.max((sha256MBps / maxMBps) * 100, 2);
+  const rowMax = Math.max(blake3MBps, sha256MBps);
+  const b3Pct = rowMax > 0 ? (blake3MBps / rowMax) * 100 : 0;
+  const shaPct = rowMax > 0 ? (sha256MBps / rowMax) * 100 : 0;
 
   b3Bar.style.width = b3Pct + '%';
   b3Bar.textContent = formatSpeed(blake3MBps);
@@ -506,13 +494,6 @@ function updateRow(row, blake3MBps, sha256MBps, maxMBps) {
     b3Badge.textContent = 'tie';
     shaBadge.textContent = 'tie';
   }
-}
-
-function rescaleRow(row, blake3MBps, sha256MBps, maxMBps) {
-  const b3Bar = row.querySelector('.bar-fill.blake3');
-  const shaBar = row.querySelector('.bar-fill.sha256');
-  b3Bar.style.width = Math.max((blake3MBps / maxMBps) * 100, 2) + '%';
-  shaBar.style.width = Math.max((sha256MBps / maxMBps) * 100, 2) + '%';
 }
 
 window._runBenchmark = runSyntheticBenchmark;
