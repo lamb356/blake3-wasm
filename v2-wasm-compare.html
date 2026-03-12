@@ -147,29 +147,29 @@
 
   // --- Benchmark helpers ---
   const SIZES = [
-    { label: '64 KiB',  bytes: 64 * 1024,   iters: 50, warmup: 5 },
-    { label: '1 MiB',   bytes: 1024 * 1024,  iters: 20, warmup: 3 },
-    { label: '16 MiB',  bytes: 16 * 1024 * 1024, iters: 5, warmup: 2 },
+    { label: '64 KiB',  bytes: 64 * 1024,   batchSize: 1000, batches: 5, warmup: 2 },
+    { label: '1 MiB',   bytes: 1024 * 1024,  batchSize: 100,  batches: 5, warmup: 2 },
+    { label: '16 MiB',  bytes: 16 * 1024 * 1024, batchSize: 10, batches: 5, warmup: 2 },
   ];
 
   function fillDeterministic(heap, ptr, size) {
     for (let i = 0; i < size; i++) heap[ptr + i] = i & 0xff;
   }
 
-  function benchHashSubtree(mod, size, iterations, warmup) {
+  function benchHashSubtree(mod, size, batchSize, batches, warmup) {
     const dataPtr = mod.alloc(size);
     const outPtr = mod.alloc(32);
     const heap = new Uint8Array(mod.memory.buffer);
     fillDeterministic(heap, dataPtr, size);
 
     // Warmup
-    for (let i = 0; i < warmup; i++) mod.hashSubtree(dataPtr, size, 0, outPtr);
+    for (let i = 0; i < warmup * batchSize; i++) mod.hashSubtree(dataPtr, size, 0, outPtr);
 
-    // Timed runs
+    // Timed batches
     const times = [];
-    for (let i = 0; i < iterations; i++) {
+    for (let b = 0; b < batches; b++) {
       const t0 = performance.now();
-      mod.hashSubtree(dataPtr, size, 0, outPtr);
+      for (let i = 0; i < batchSize; i++) mod.hashSubtree(dataPtr, size, 0, outPtr);
       times.push(performance.now() - t0);
     }
 
@@ -180,7 +180,8 @@
     mod.free(dataPtr, size);
 
     times.sort((a, b) => a - b);
-    return { medianMs: times[Math.floor(times.length / 2)], cv, times };
+    const medianMs = times[Math.floor(times.length / 2)];
+    return { medianMs, perCallMs: medianMs / batchSize, cv, times };
   }
 
   function benchParentCvOrRoot(mod, fnName, batchSize, batches, warmup) {
@@ -228,8 +229,8 @@
       const div = document.createElement('div');
       div.className = 'test running';
 
-      const oldResult = benchHashSubtree(oldMod, bytes, 1, 0);
-      const newResult = benchHashSubtree(newMod, bytes, 1, 0);
+      const oldResult = benchHashSubtree(oldMod, bytes, 1, 1, 0);
+      const newResult = benchHashSubtree(newMod, bytes, 1, 1, 0);
       const match = arraysEqual(oldResult.cv, newResult.cv);
 
       if (match) {
@@ -349,26 +350,26 @@
 
       // Benchmark hash_subtree
       const rows = [];
-      for (const { label, bytes, iters, warmup } of SIZES) {
-        log(`Benchmarking hash_subtree ${label} (${iters} iters)...`);
+      for (const { label, bytes, batchSize, batches, warmup } of SIZES) {
+        log(`Benchmarking hash_subtree ${label} (${batches} batches of ${batchSize})...`);
 
         await new Promise(r => setTimeout(r, 10));
-        const oldResult = benchHashSubtree(oldMod, bytes, iters, warmup);
-        log(`  Old: ${oldResult.medianMs.toFixed(3)} ms`);
+        const oldResult = benchHashSubtree(oldMod, bytes, batchSize, batches, warmup);
+        log(`  Old: ${oldResult.perCallMs.toFixed(3)} ms/call (batch ${oldResult.medianMs.toFixed(3)} ms)`);
 
         await new Promise(r => setTimeout(r, 10));
-        const newResult = benchHashSubtree(newMod, bytes, iters, warmup);
-        log(`  New: ${newResult.medianMs.toFixed(3)} ms`);
+        const newResult = benchHashSubtree(newMod, bytes, batchSize, batches, warmup);
+        log(`  New: ${newResult.perCallMs.toFixed(3)} ms/call (batch ${newResult.medianMs.toFixed(3)} ms)`);
 
         const mbPerSec = (ms) => ms > 0 ? ((bytes / 1024 / 1024) / (ms / 1000)).toFixed(1) : '∞';
 
         rows.push({
           op: 'hash_subtree',
           size: label,
-          oldMs: oldResult.medianMs,
-          oldMBs: mbPerSec(oldResult.medianMs),
-          newMs: newResult.medianMs,
-          newMBs: mbPerSec(newResult.medianMs),
+          oldMs: oldResult.perCallMs,
+          oldMBs: mbPerSec(oldResult.perCallMs),
+          newMs: newResult.perCallMs,
+          newMBs: mbPerSec(newResult.perCallMs),
         });
       }
 
